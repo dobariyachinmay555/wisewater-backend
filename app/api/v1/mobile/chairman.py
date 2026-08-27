@@ -64,9 +64,10 @@ def get_chairman_dashboard_summary(
     if total_meters == 0:
         total_meters = total_units
         
-    pending_readings = db.query(MeterReading).filter(
+    pending_readings = db.query(MeterReading).join(User, MeterReading.user_id == User.id).filter(
         MeterReading.society_id == soc_id,
-        MeterReading.status == 0
+        MeterReading.status == 0,
+        User.approval_status == 1
     ).count()
     
     approved_readings = db.query(MeterReading).filter(
