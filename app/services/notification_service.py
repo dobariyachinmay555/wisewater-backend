@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from typing import List, Optional
 import httpx
 from sqlalchemy.orm import Session
