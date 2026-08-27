@@ -54,6 +54,19 @@ def get_current_mobile_user(
         )
     return user
 
+def resolve_media_url(raw_url: Optional[str]) -> str:
+    """Normalize any image/file URL to a fully qualified live HTTPS URL."""
+    if not raw_url or not raw_url.strip():
+        return ""
+    url = raw_url.strip()
+    # Strip local dev origins if present in legacy rows
+    url = url.replace("http://127.0.0.1:8000", "").replace("http://localhost:8000", "")
+    if url.startswith("http://") or url.startswith("https://"):
+        return url
+    if not url.startswith("/"):
+        url = "/" + url
+    return f"https://wisewater-backend.onrender.com{url}"
+
 def format_user_details(user: User) -> dict:
     """Format user to exact UserDetailsModel JSON expected by Flutter."""
     society_data = None
@@ -97,11 +110,7 @@ def format_user_details(user: User) -> dict:
     if user.readings:
         sorted_readings = sorted(user.readings, key=lambda r: r.id, reverse=True)
         if sorted_readings and sorted_readings[0].image_url:
-            raw_img = sorted_readings[0].image_url
-            if raw_img.startswith("http://") or raw_img.startswith("https://"):
-                meter_img = raw_img
-            else:
-                meter_img = f"{raw_img if raw_img.startswith('/') else '/' + raw_img}"
+            meter_img = resolve_media_url(sorted_readings[0].image_url)
 
     return {
         "user_id": user.id,

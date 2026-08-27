@@ -12,7 +12,7 @@ from app.models.reading import MeterReading
 from app.models.society import Society
 from app.models.billing import Bill
 from app.schemas.mobile import MobileApiResponse, UpdatePreviousUnitRequest
-from app.api.v1.mobile.deps import get_current_mobile_user
+from app.api.v1.mobile.deps import get_current_mobile_user, resolve_media_url
 from app.services.billing_service import calculate_reading_bill, generate_bill_for_reading
 from app.services.pdf_service import generate_water_bill_pdf
 
@@ -25,8 +25,10 @@ def get_unit_readings(
     current_user: User = Depends(get_current_mobile_user),
     db: Session = Depends(get_db)
 ):
-    """Fetch meter readings history for current user or selected apartment user."""
-    target_user_id = apartment_user_id or current_user.id
+    """Get history of unit readings for a user or target resident."""
+    target_user_id = current_user.id
+    if apartment_user_id and apartment_user_id > 0:
+        target_user_id = apartment_user_id
     
     readings = db.query(MeterReading).filter(
         MeterReading.user_id == target_user_id
@@ -35,9 +37,6 @@ def get_unit_readings(
     result = []
     for r in readings:
         created_str = r.created_at.strftime("%d %b %Y") if r.created_at else ""
-        img_url = r.image_url or ""
-        if img_url and not (img_url.startswith("http://") or img_url.startswith("https://")):
-            img_url = f"{img_url if img_url.startswith('/') else '/' + img_url}"
 
         # If approved, attach or generate Bill
         bill_data = None
@@ -68,7 +67,7 @@ def get_unit_readings(
             "total_unit": r.total_unit,
             "unit_price": float(r.unit_price),
             "total_price": float(r.total_price),
-            "image": img_url,
+            "image": resolve_media_url(r.image_url),
             "status": r.status,  # 0: Pending, 1: Approved, 2: Rejected
             "remarks": r.remarks or ("Approved" if r.status == 1 else "Pending"),
             "created_at": created_str,

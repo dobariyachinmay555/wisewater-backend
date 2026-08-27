@@ -78,6 +78,8 @@ def update_pending_request_status(
     msg = "Request accepted successfully" if payload.status == 1 else "Request rejected successfully"
     return MobileApiResponse(status=1, message=msg, data={})
 
+from app.api.v1.mobile.deps import get_current_mobile_user, format_user_details, resolve_media_url
+
 @router.get("/pending-unit-reading-requests", response_model=MobileApiResponse)
 def get_pending_reading_requests(
     block_id: Optional[int] = Query(None),
@@ -86,9 +88,10 @@ def get_pending_reading_requests(
 ):
     """Get pending meter readings submitted by residents."""
     soc_id = current_user.society_id or 1
-    query = db.query(MeterReading).filter(
+    query = db.query(MeterReading).join(User, MeterReading.user_id == User.id).filter(
         MeterReading.society_id == soc_id,
-        MeterReading.status == 0  # Pending
+        MeterReading.status == 0,  # Pending
+        User.approval_status == 1  # Only show reading requests for approved members!
     )
     if block_id is not None and block_id > 0:
         query = query.filter(MeterReading.block_id == block_id)
@@ -99,17 +102,13 @@ def get_pending_reading_requests(
         user = db.query(User).filter(User.id == r.user_id).first()
         user_data = format_user_details(user) if user else None
         
-        img_url = r.image_url or ""
-        if img_url and not (img_url.startswith("http://") or img_url.startswith("https://")):
-            img_url = f"{img_url if img_url.startswith('/') else '/' + img_url}"
-
         result.append({
             "user_unit_history_id": r.id,
             "previous_unit": r.previous_unit,
             "current_unit": r.current_unit,
             "total_unit": r.total_unit,
             "unit_price": float(r.unit_price),
-            "image": img_url,
+            "image": resolve_media_url(r.image_url),
             "status": r.status,
             "created_at": r.created_at.strftime("%d %b %Y") if r.created_at else "",
             "user_details": user_data
