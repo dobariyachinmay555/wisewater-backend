@@ -101,7 +101,7 @@ def get_pending_reading_requests(
         
         img_url = r.image_url or ""
         if img_url and not (img_url.startswith("http://") or img_url.startswith("https://")):
-            img_url = f"http://127.0.0.1:8000{img_url if img_url.startswith('/') else '/' + img_url}"
+            img_url = f"{img_url if img_url.startswith('/') else '/' + img_url}"
 
         result.append({
             "user_unit_history_id": r.id,

@@ -28,8 +28,7 @@ async def upload_image(
     with open(file_path, "wb") as buffer:
         shutil.copyfileobj(image.file, buffer)
     rel_url = f"/uploads/{file_name}"
-    full_url = f"http://127.0.0.1:8000{rel_url}"
-    return MobileApiResponse(status=1, message="Image uploaded successfully", data={"image_url": rel_url, "full_url": full_url})
+    return MobileApiResponse(status=1, message="Image uploaded successfully", data={"image_url": rel_url, "full_url": rel_url})
 
 
 @router.get("/search-apartments", response_model=MobileApiResponse)

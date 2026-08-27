@@ -37,7 +37,7 @@ def get_unit_readings(
         created_str = r.created_at.strftime("%d %b %Y") if r.created_at else ""
         img_url = r.image_url or ""
         if img_url and not (img_url.startswith("http://") or img_url.startswith("https://")):
-            img_url = f"http://127.0.0.1:8000{img_url if img_url.startswith('/') else '/' + img_url}"
+            img_url = f"{img_url if img_url.startswith('/') else '/' + img_url}"
 
         # If approved, attach or generate Bill
         bill_data = None
@@ -269,13 +269,12 @@ def download_reading_report(
         writer.writerow(["", "", "", "", "TOTALS:", "", "", total_consumption, "", f"{total_revenue:.2f}", "", ""])
 
     rel_url = f"/uploads/{filename}"
-    full_url = f"http://127.0.0.1:8000{rel_url}"
 
     return MobileApiResponse(
         status=1,
         message=f"{'6-Months' if period_type == '6_MONTHS' else '1-Month'} report generated successfully",
         data={
-            "file_url": full_url,
+            "file_url": rel_url,
             "filename": filename,
             "period_type": period_type,
             "total_members": len(users),
@@ -330,13 +329,11 @@ def download_bill_pdf(
         payment_status=bill.payment_status if bill else "UNPAID"
     )
     
-    full_url = f"http://127.0.0.1:8000{rel_pdf_path}"
-    
     return MobileApiResponse(
         status=1,
         message="Bill PDF generated successfully",
         data={
-            "file_url": full_url,
+            "file_url": rel_pdf_path,
             "filename": os.path.basename(rel_pdf_path),
             "bill_number": bill.bill_number if bill else f"BILL-{reading.id}"
         }

@@ -101,7 +101,7 @@ def format_user_details(user: User) -> dict:
             if raw_img.startswith("http://") or raw_img.startswith("https://"):
                 meter_img = raw_img
             else:
-                meter_img = f"http://127.0.0.1:8000{raw_img if raw_img.startswith('/') else '/' + raw_img}"
+                meter_img = f"{raw_img if raw_img.startswith('/') else '/' + raw_img}"
 
     return {
         "user_id": user.id,
