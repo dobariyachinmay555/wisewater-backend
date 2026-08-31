@@ -285,6 +285,21 @@ def submit_join_society_request(
         db.add(init_r)
         db.commit()
 
+    # Notify Chairman
+    try:
+        from app.services.notification_service import notify_society_chairman
+        notify_society_chairman(
+            db=db,
+            society_id=soc.id,
+            title=f"New Member Join Request: {user.name}",
+            message=f"Flat/House: {flat_or_house or 'N/A'} • Mobile: {user.mobile_number}. Tap to review & approve.",
+            notification_type="MEMBER_REQUEST",
+            data={"user_id": str(user.id), "society_id": str(soc.id)},
+            sender_id=user.id
+        )
+    except Exception as e:
+        pass
+
     from app.core.security import create_access_token
     token = create_access_token(
         subject=user.id,

@@ -142,6 +142,23 @@ async def store_unit_reading(
         
     db.commit()
     db.refresh(reading)
+
+    # Notify Society Chairman if submitted by resident for review
+    if initial_status == 0 and target_user.society_id:
+        try:
+            from app.services.notification_service import notify_society_chairman
+            flat_info = target_user.flat_number or "Unit"
+            notify_society_chairman(
+                db=db,
+                society_id=target_user.society_id,
+                title=f"New Meter Reading: {target_user.name} ({flat_info})",
+                message=f"Resident submitted {current_unit_val} units (Consumed: {total_unit} units). Tap to review & approve.",
+                notification_type="READING_REQUEST",
+                data={"reading_id": str(reading.id), "user_id": str(target_user.id)},
+                sender_id=target_user.id
+            )
+        except Exception as e:
+            pass
     
     return MobileApiResponse(
         status=1,

@@ -75,6 +75,35 @@ def update_pending_request_status(
                 r.remarks = "Approved Baseline Reading"
 
     db.commit()
+
+    # Send push notification to resident
+    try:
+        from app.services.notification_service import send_user_notification
+        soc_name = user.society.name if user.society else "the society"
+        if payload.status == 1:
+            send_user_notification(
+                db=db,
+                user_id=user.id,
+                title="Society Member Approved! 🎉",
+                message=f"Chairman successfully approved your member request for Flat/House {user.flat_number or ''} in {soc_name}.",
+                notification_type="JOIN_APPROVED",
+                data={"status": "APPROVED", "society_id": str(user.society_id or "")},
+                sender_id=current_user.id
+            )
+        else:
+            send_user_notification(
+                db=db,
+                user_id=user.id,
+                title="Society Join Request Update",
+                message=f"Your request to join {soc_name} was not approved by the Society Chairman.",
+                notification_type="JOIN_REJECTED",
+                data={"status": "REJECTED"},
+                sender_id=current_user.id
+            )
+    except Exception as e:
+        pass
+
+
     msg = "Request accepted successfully" if payload.status == 1 else "Request rejected successfully"
     return MobileApiResponse(status=1, message=msg, data={})
 
@@ -130,13 +159,47 @@ def update_pending_reading_status(
     reading.approved_by_user_id = current_user.id
     reading.approved_at = datetime.now(timezone.utc)
     
+    bill = None
     if payload.status == 1:
         # Update user's previous baseline reading and generate bill
         user = db.query(User).filter(User.id == reading.user_id).first()
         if user:
             user.previous_unit = reading.current_unit
-        generate_bill_for_reading(db, reading)
+        bill = generate_bill_for_reading(db, reading)
         
     db.commit()
+
+    # Send push notification to resident
+    try:
+        from app.services.notification_service import send_user_notification
+        if payload.status == 1:
+            amount_str = f"₹{reading.total_price:.2f}" if reading.total_price else "₹0.00"
+            send_user_notification(
+                db=db,
+                user_id=reading.user_id,
+                title="Meter Reading Approved 💧",
+                message=f"Chairman successfully approved your meter reading of {reading.current_unit} units ({reading.total_unit} units consumed). Bill: {amount_str}.",
+                notification_type="READING_APPROVED",
+                data={
+                    "reading_id": str(reading.id),
+                    "bill_id": str(bill.id) if bill else "",
+                    "status": "APPROVED"
+                },
+                sender_id=current_user.id
+            )
+        else:
+            send_user_notification(
+                db=db,
+                user_id=reading.user_id,
+                title="Meter Reading Rejected",
+                message="Your submitted meter reading was rejected by the Society Chairman. Please verify and submit a new reading.",
+                notification_type="READING_REJECTED",
+                data={"reading_id": str(reading.id), "status": "REJECTED"},
+                sender_id=current_user.id
+            )
+    except Exception as e:
+        pass
+
+
     msg = "Request accepted successfully" if payload.status == 1 else "Request rejected successfully"
     return MobileApiResponse(status=1, message=msg, data={})

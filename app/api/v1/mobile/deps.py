@@ -1,17 +1,20 @@
 from typing import Optional
-from fastapi import Depends, HTTPException, Header, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.models.user import User
 
+security = HTTPBearer(auto_error=False)
+
 def get_current_mobile_user(
-    authorization: Optional[str] = Header(None),
+    auth_credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     db: Session = Depends(get_db)
 ) -> User:
     """Extract and authenticate the mobile user from Bearer JWT token."""
     # If no token provided or default mock development fallback
-    if not authorization:
+    if not auth_credentials or not auth_credentials.credentials:
         # Fallback to User 1 (Super Admin Chairman) during local testing if no header is sent
         user = db.query(User).filter(User.id == 1).first()
         if user:
@@ -21,8 +24,9 @@ def get_current_mobile_user(
             detail="Authentication token missing"
         )
     
-    token = authorization.replace("Bearer ", "").strip()
+    token = auth_credentials.credentials.replace("Bearer ", "").strip()
     payload = decode_access_token(token)
+
     
     if not payload:
         # Check if it's the development mock token
@@ -36,23 +40,44 @@ def get_current_mobile_user(
         )
         
     user_id = payload.get("sub")
+    user = None
+
     if not str(user_id).isdigit():
         temp_mobile = str(user_id).replace("temp_", "")
         user = db.query(User).filter(User.mobile_number == temp_mobile).first()
         if not user:
+            print(f"[AUTH DIAGNOSTICS] Temp user sub '{user_id}' not found by mobile '{temp_mobile}'")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Registration incomplete. Please submit registration form."
             )
-        return user
+    else:
+        user = db.query(User).filter(User.id == int(user_id)).first()
+        if not user and payload.get("mobile_number"):
+            user = db.query(User).filter(User.mobile_number == str(payload.get("mobile_number"))).first()
 
-    user = db.query(User).filter(User.id == int(user_id)).first()
+    # Safe Diagnostic Logging
+    has_token = bool(user and user.fcm_token and user.fcm_token.strip())
+    token_len = len(user.fcm_token.strip()) if has_token else 0
+    token_prefix = user.fcm_token.strip()[:15] + "..." if has_token else "NONE"
+
+    print("=" * 60)
+    print(f"[AUTH DIAGNOSTICS]")
+    print(f"Authenticated User ID (from JWT sub): {user_id}")
+    print(f"Authenticated User Role (from JWT): {payload.get('role')} (user_type: {payload.get('user_type')})")
+    print(f"User Record Found in DB: {bool(user)}")
+    if user:
+        print(f"DB User ID: {user.id}, Mobile: {user.mobile_number}, Name: {user.name}")
+        print(f"FCM Token Exists: {has_token} (Length: {token_len}, Prefix: {token_prefix})")
+    print("=" * 60)
+
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
+            detail=f"User ID {user_id} not found in database"
         )
     return user
+
 
 def resolve_media_url(raw_url: Optional[str]) -> str:
     """Normalize any image/file URL to a fully qualified live HTTPS URL."""

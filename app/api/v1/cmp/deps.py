@@ -1,23 +1,27 @@
 from typing import Optional, List
-from fastapi import Depends, HTTPException, Header, status
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import decode_access_token
 from app.models.company import CompanyStaff
 
+cmp_security = HTTPBearer(auto_error=False)
+
 def get_current_staff(
-    authorization: Optional[str] = Header(None),
+    auth_credentials: Optional[HTTPAuthorizationCredentials] = Depends(cmp_security),
     db: Session = Depends(get_db)
 ) -> CompanyStaff:
     """Authenticate company staff from Bearer JWT token."""
-    if not authorization:
+    if not auth_credentials or not auth_credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Admin authentication required"
         )
         
-    token = authorization.replace("Bearer ", "").strip()
+    token = auth_credentials.credentials.replace("Bearer ", "").strip()
     payload = decode_access_token(token)
+
     
     if not payload or payload.get("role") not in ["company_staff", "OWNER", "SUPER_ADMIN", "ADMIN", "SUPPORT", "FINANCE", "READ_ONLY"]:
         raise HTTPException(

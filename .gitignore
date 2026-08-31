@@ -3,3 +3,10 @@ __pycache__/
 *.pyc
 wisewater.db
 uploads/
+
+firebase-service-account.json
+*firebase*.json
+*service-account*.json
+*serviceAccount*.json
+*credentials*.json
+*.pem

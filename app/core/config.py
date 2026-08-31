@@ -55,5 +55,10 @@ class Settings(BaseSettings):
     # MSG91 (India)
     MSG91_AUTH_KEY: str = Field(default="")
     MSG91_TEMPLATE_ID: str = Field(default="")
+    
+    # Firebase Cloud Messaging (FCM) Push Notifications
+    # Path to service account JSON (e.g. "firebase-service-account.json") or raw JSON string
+    FIREBASE_CREDENTIALS_PATH: str = Field(default="")
+    FIREBASE_CREDENTIALS_JSON: str = Field(default="")
 
 settings = Settings()

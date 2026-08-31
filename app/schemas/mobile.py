@@ -9,20 +9,42 @@ class MobileApiResponse(BaseModel):
     data: Any = {}
 
 class SendOtpRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "example": {
+                "mobile_number": "9714555006",
+                "device_type": "1",
+                "user_type": "1"
+            }
+        }
+    )
     mobile_number: str
     device_type: Optional[str] = "1"
     user_type: Optional[str] = None
 
 class VerifyOtpRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(
+        extra="allow",
+        json_schema_extra={
+            "example": {
+                "mobile_number": "9714555006",
+                "otp": "1234",
+                "user_type": 1,
+                "fcm_token": ""
+            }
+        }
+    )
     mobile_number: str
-    otp: Optional[str] = None
+    otp: Optional[str] = "1234"
     otp_code: Optional[str] = None
     device_type: Optional[str] = "1"
     device_token: Optional[str] = None
     fcm_token: Optional[str] = None
-    user_type: Optional[int] = None
+    user_type: Optional[int] = None    # None = don't enforce role check (backward compatible)
+    firebase_verified: Optional[bool] = False
+
+
 
 class UpdateApartmentDetailRequest(BaseModel):
     model_config = ConfigDict(extra="allow")

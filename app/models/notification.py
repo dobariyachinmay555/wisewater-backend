@@ -19,3 +19,16 @@ class Notification(Base):
     society = relationship("Society")
     user = relationship("User", foreign_keys=[user_id])
     sender = relationship("User", foreign_keys=[sender_id])
+    reads = relationship("NotificationRead", back_populates="notification", cascade="all, delete-orphan")
+
+class NotificationRead(Base):
+    __tablename__ = "notification_reads"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    notification_id = Column(Integer, ForeignKey("notifications.id", ondelete="CASCADE"), nullable=False, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    read_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    notification = relationship("Notification", back_populates="reads")
+    user = relationship("User")
+

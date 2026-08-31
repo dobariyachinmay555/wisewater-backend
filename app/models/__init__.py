@@ -5,8 +5,7 @@ from app.models.meter import Meter
 from app.models.reading import MeterReading
 from app.models.billing import Bill, Payment
 from app.models.audit import AuditLog
-from app.models.otp import OtpVerification
-from app.models.notification import Notification
+from app.models.notification import Notification, NotificationRead
 
 __all__ = [
     "CompanyStaff",
@@ -22,5 +21,7 @@ __all__ = [
     "Payment",
     "AuditLog",
     "OtpVerification",
-    "Notification"
+    "Notification",
+    "NotificationRead"
 ]
+

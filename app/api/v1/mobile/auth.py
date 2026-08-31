@@ -1,12 +1,13 @@
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.security import create_access_token
 from app.models.user import User
 from app.models.otp import OtpVerification
 from app.api.v1.mobile.deps import format_user_details
+from app.schemas.mobile import SendOtpRequest, VerifyOtpRequest
 
 from app.core.config import settings
 from app.services.sms_service import send_sms_otp, generate_otp
@@ -14,15 +15,10 @@ from app.services.sms_service import send_sms_otp, generate_otp
 router = APIRouter()
 
 @router.post("/send-otp")
-async def send_otp(request: Request, db: Session = Depends(get_db)):
+async def send_otp(body: SendOtpRequest, db: Session = Depends(get_db)):
     """Send real OTP to mobile number with robust SMS gateway integration."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-        
-    mobile = str(body.get("mobile_number") or body.get("phone_number") or "").strip()
-    user_type = body.get("user_type")
+    mobile = str(body.mobile_number or "").strip()
+    user_type = body.user_type
     if not mobile or len(mobile) < 10:
         return {"status": 0, "message": "Please enter a valid 10-digit mobile number", "data": {}}
 
@@ -80,22 +76,18 @@ async def send_otp(request: Request, db: Session = Depends(get_db)):
     }
 
 @router.post("/verify-otp")
-async def verify_otp(request: Request, db: Session = Depends(get_db)):
+async def verify_otp(body: VerifyOtpRequest, db: Session = Depends(get_db)):
     """Verify OTP and authenticate or register mobile user."""
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-        
-    mobile = str(body.get("mobile_number") or body.get("phone_number") or "").strip()
-    otp = str(body.get("otp_code") or body.get("otp") or "").strip()
-    user_type = body.get("user_type")
-    
+    mobile = str(body.mobile_number or "").strip()
+    otp = str(body.otp_code or body.otp or "").strip()
+    user_type = body.user_type
+    firebase_verified = bool(body.firebase_verified)
+    fcm_token = str(body.fcm_token or "").strip()
+
     if not mobile or len(mobile) < 10:
         return {"status": 0, "message": "Please enter a valid mobile number", "data": {}}
         
     otp_entry = db.query(OtpVerification).filter(OtpVerification.mobile_number == mobile).first()
-    firebase_verified = bool(body.get("firebase_verified", False))
     
     # Check valid dynamic OTP or optional developer test bypass
     now_utc = datetime.utcnow()
@@ -144,6 +136,11 @@ async def verify_otp(request: Request, db: Session = Depends(get_db)):
                 ),
                 "data": {}
             }
+        if fcm_token:
+            user.fcm_token = fcm_token
+            db.commit()
+            db.refresh(user)
+
         token = create_access_token(
             subject=user.id,
             role="resident" if user.user_type == 1 else "admin",
@@ -183,6 +180,7 @@ async def verify_otp(request: Request, db: Session = Depends(get_db)):
                 user_type=1,
                 approval_status=1,
                 previous_unit=0,
+                fcm_token=fcm_token if fcm_token else None,
                 is_active=True
             )
             db.add(user)
@@ -195,6 +193,7 @@ async def verify_otp(request: Request, db: Session = Depends(get_db)):
                 user_type=user.user_type
             )
             user_details = format_user_details(user)
+
         
     return {
         "status": 1,
@@ -204,3 +203,5 @@ async def verify_otp(request: Request, db: Session = Depends(get_db)):
             "user_details": user_details
         }
     }
+
+
