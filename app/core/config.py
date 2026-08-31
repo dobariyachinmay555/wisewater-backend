@@ -42,7 +42,9 @@ class Settings(BaseSettings):
 
     # SMS Gateway Configuration
     SMS_PROVIDER: str = Field(default="fast2sms")  # Options: fast2sms, twilio, msg91, mock
-    ENABLE_TEST_OTP_BYPASS: bool = Field(default=True)  # Enabled for development/testing convenience
+    ENABLE_TEST_OTP_BYPASS: bool = Field(default=False)  # Must default to False for production
+    OTP_EXPIRE_MINUTES: int = 10
+    MAX_OTP_ATTEMPTS: int = 5
     
     # Fast2SMS (India)
     FAST2SMS_API_KEY: str = Field(default="")

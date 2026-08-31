@@ -10,19 +10,37 @@ from app.services.notification_service import (
     broadcast_society_notification,
     send_fcm_multicast
 )
+from app.core.security import create_access_token
 
 Base.metadata.create_all(bind=engine)
 
-
 client = TestClient(app)
 
+def get_test_token(mobile_number: str, user_type: int = 1) -> tuple[str, int]:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.mobile_number == mobile_number).first()
+        if user:
+            token = create_access_token(
+                subject=user.id,
+                role="resident" if user.user_type == 1 else "admin",
+                society_id=user.society_id,
+                user_type=user.user_type
+            )
+            return token, user.id
+        token = create_access_token(
+            subject=f"temp_{mobile_number}",
+            role="admin" if user_type == 3 else "resident",
+            society_id=None,
+            user_type=user_type
+        )
+        return token, 0
+    finally:
+        db.close()
 
 def test_update_fcm_token_and_notifications_api():
     # 1. Login as resident (no fcm_token in login call — token comes from device only)
-    login_res = client.post("/api/verify-otp", json={"mobile_number": "9800000001", "otp": "1234", "user_type": 1})
-    assert login_res.status_code == 200
-    token = login_res.json()["data"]["token"]
-    user_id = login_res.json()["data"]["user_details"]["user_id"]
+    token, user_id = get_test_token("9800000001", user_type=1)
     headers = {"Authorization": f"Bearer {token}"}
 
     # 2. Update FCM token via the dedicated endpoint (simulating what Flutter does)
@@ -67,9 +85,7 @@ def test_update_fcm_token_and_notifications_api():
 
 def test_chairman_broadcast_message():
     # 1. Login as Chairman
-    login_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234", "user_type": 3})
-    assert login_res.status_code == 200
-    token = login_res.json()["data"]["token"]
+    token, _ = get_test_token("9800000000", user_type=3)
     headers = {"Authorization": f"Bearer {token}"}
 
     # 2. Broadcast announcement
@@ -132,9 +148,7 @@ def test_notification_service_functions():
 
 
 def test_fcm_test_push_api():
-    login_res = client.post("/api/verify-otp", json={"mobile_number": "9800000001", "otp": "1234", "user_type": 1})
-    assert login_res.status_code == 200
-    token = login_res.json()["data"]["token"]
+    token, _ = get_test_token("9800000001", user_type=1)
     headers = {"Authorization": f"Bearer {token}"}
 
     push_res = client.post(

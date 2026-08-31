@@ -29,14 +29,14 @@ class VerifyOtpRequest(BaseModel):
         json_schema_extra={
             "example": {
                 "mobile_number": "9714555006",
-                "otp": "1234",
+                "otp": "839201",
                 "user_type": 1,
                 "fcm_token": ""
             }
         }
     )
     mobile_number: str
-    otp: Optional[str] = "1234"
+    otp: Optional[str] = None
     otp_code: Optional[str] = None
     device_type: Optional[str] = "1"
     device_token: Optional[str] = None

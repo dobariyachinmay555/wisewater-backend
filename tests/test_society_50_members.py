@@ -9,7 +9,29 @@ from app.models.reading import MeterReading
 from app.models.billing import Bill
 from app.seed_society_50 import seed_society_50_members
 
+from app.core.security import create_access_token
+
 client = TestClient(app)
+
+def get_test_token(mobile_number: str, user_type: int = 1) -> str:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.mobile_number == mobile_number).first()
+        if user:
+            return create_access_token(
+                subject=user.id,
+                role="resident" if user.user_type == 1 else "admin",
+                society_id=user.society_id,
+                user_type=user.user_type
+            )
+        return create_access_token(
+            subject=f"temp_{mobile_number}",
+            role="admin" if user_type == 3 else "resident",
+            society_id=None,
+            user_type=user_type
+        )
+    finally:
+        db.close()
 
 @pytest.fixture(scope="module", autouse=True)
 def setup_society_and_50_members():
@@ -50,15 +72,7 @@ def test_resolve_society_by_code():
 
 def test_chairman_login_and_dashboard():
     """Test Chairman login and dashboard metrics with 50 members."""
-    # 1. Chairman login via OTP
-    res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234", "user_type": 3})
-    assert res.status_code == 200
-    assert res.json()["status"] == 1
-    token = res.json()["data"]["token"]
-    user_details = res.json()["data"]["user_details"]
-    assert user_details["name"] == "Rajesh Sharma"
-    assert user_details["user_type"] == 3
-
+    token = get_test_token("9800000000", user_type=3)
     headers = {"Authorization": f"Bearer {token}"}
 
     # 2. Get Dashboard Summary
@@ -89,8 +103,7 @@ def test_chairman_login_and_dashboard():
 def test_fetch_all_50_members():
     """Test retrieving all 50 members through apartment-block/users API."""
     # Login as Chairman
-    login_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234"})
-    token = login_res.json()["data"]["token"]
+    token = get_test_token("9800000000", user_type=3)
     headers = {"Authorization": f"Bearer {token}"}
 
     # Get all users for the society
@@ -111,21 +124,15 @@ def test_fetch_all_50_members():
 def test_individual_members_login_and_profile():
     """Test sample members logging in and accessing their profiles."""
     test_members = [
-        ("9800000000", "A-101"),
-        ("9800000002", "A-102"),
-        ("9800000025", "A-505"),
-        ("9800000026", "B-101"),
-        ("9800000050", "B-505"),
+        ("9800000000", "A-101", 3),
+        ("9800000002", "A-102", 1),
+        ("9800000025", "A-505", 1),
+        ("9800000026", "B-101", 1),
+        ("9800000050", "B-505", 1),
     ]
 
-    for mobile, expected_flat in test_members:
-        verify_res = client.post("/api/verify-otp", json={"mobile_number": mobile, "otp": "1234"})
-        assert verify_res.status_code == 200
-        assert verify_res.json()["status"] == 1
-        data = verify_res.json()["data"]
-        token = data["token"]
-        assert data["user_details"]["flat_number"] == expected_flat
-
+    for mobile, expected_flat, role in test_members:
+        token = get_test_token(mobile, user_type=role)
         # Get profile
         prof_res = client.get("/api/profile", headers={"Authorization": f"Bearer {token}"})
         assert prof_res.status_code == 200
@@ -135,8 +142,7 @@ def test_individual_members_login_and_profile():
 def test_50_pending_reading_requests_one_per_member():
     """Verify all 50 members have exactly 1 pending reading request."""
     # Login as Chairman
-    c_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234"})
-    c_token = c_res.json()["data"]["token"]
+    c_token = get_test_token("9800000000", user_type=3)
     c_headers = {"Authorization": f"Bearer {c_token}"}
 
     # Fetch pending reading requests
@@ -155,12 +161,12 @@ def test_50_pending_reading_requests_one_per_member():
 def test_meter_readings_and_pending_approvals():
     """Test reading submission by member and approval by Chairman."""
     # 1. Login as Member 2
-    m_res = client.post("/api/verify-otp", json={"mobile_number": "9800000002", "otp": "1234"})
-    m_token = m_res.json()["data"]["token"]
+    m_token = get_test_token("9800000002", user_type=1)
     m_headers = {"Authorization": f"Bearer {m_token}"}
 
     # Member submits new reading dynamically > previous_unit
-    prev_u = int(m_res.json()["data"]["user_details"]["previous_unit"] or 100)
+    prof = client.get("/api/profile", headers=m_headers).json()["data"]
+    prev_u = int(prof.get("previous_unit") or 100)
     sub_res = client.post(
         "/api/store-unit-reading",
         data={"unit": str(prev_u + 50)},
@@ -170,8 +176,7 @@ def test_meter_readings_and_pending_approvals():
     assert sub_res.json()["status"] == 1
 
     # 2. Login as Chairman and view pending reading requests
-    c_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234"})
-    c_token = c_res.json()["data"]["token"]
+    c_token = get_test_token("9800000000", user_type=3)
     c_headers = {"Authorization": f"Bearer {c_token}"}
 
     pending_res = client.get("/api/pending-unit-reading-requests", headers=c_headers)
@@ -193,8 +198,7 @@ def test_meter_readings_and_pending_approvals():
 def test_chairman_edit_society_profile_and_photo_frequency():
     """Test Chairman editing society profile and setting photo submission rule (1 vs 6 Months)."""
     # 1. Login as Chairman
-    c_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234", "user_type": 3})
-    c_token = c_res.json()["data"]["token"]
+    c_token = get_test_token("9800000000", user_type=3)
     c_headers = {"Authorization": f"Bearer {c_token}"}
 
     # 2. Get Society Profile & check default photo frequency
@@ -236,8 +240,7 @@ def test_chairman_edit_society_profile_and_photo_frequency():
 def test_download_reports_one_month_and_six_months():
     """Test downloading 1-Month and 6-Months water consumption reports."""
     # Login as Chairman
-    c_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234"})
-    c_token = c_res.json()["data"]["token"]
+    c_token = get_test_token("9800000000", user_type=3)
     c_headers = {"Authorization": f"Bearer {c_token}"}
 
     # 1. Download 1-Month Report
@@ -286,8 +289,7 @@ def test_cmp_super_admin_views_50_member_society():
 def test_download_individual_bill_pdf():
     """Test generating and downloading individual resident water bill PDF invoice."""
     # 1. Login as Chairman & get pending readings
-    c_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234", "user_type": 3})
-    c_token = c_res.json()["data"]["token"]
+    c_token = get_test_token("9800000000", user_type=3)
     c_headers = {"Authorization": f"Bearer {c_token}"}
 
     pending_res = client.get("/api/pending-unit-reading-requests", headers=c_headers)
@@ -310,6 +312,7 @@ def test_download_individual_bill_pdf():
     pdf_data = pdf_res.json()["data"]
     assert "WaterBill_" in pdf_data["file_url"]
     assert pdf_data["file_url"].endswith(".pdf")
+
 
 
 

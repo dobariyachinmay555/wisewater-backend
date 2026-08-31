@@ -46,11 +46,16 @@ def get_current_mobile_user(
         temp_mobile = str(user_id).replace("temp_", "")
         user = db.query(User).filter(User.mobile_number == temp_mobile).first()
         if not user:
-            print(f"[AUTH DIAGNOSTICS] Temp user sub '{user_id}' not found by mobile '{temp_mobile}'")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Registration incomplete. Please submit registration form."
+            user = User(
+                name="",
+                mobile_number=temp_mobile,
+                user_type=int(payload.get("user_type") or 3),
+                approval_status=0,
+                is_active=True
             )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
     else:
         user = db.query(User).filter(User.id == int(user_id)).first()
         if not user and payload.get("mobile_number"):

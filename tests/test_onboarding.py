@@ -1,21 +1,35 @@
 import pytest
+from unittest.mock import patch, AsyncMock
 from fastapi.testclient import TestClient
 from app.main import app
+from app.core.database import SessionLocal
+from app.models.otp import OtpVerification
+from app.core.security import create_access_token
 
 client = TestClient(app)
 
 def test_onboarding_otp_send_and_verify():
-    # 1. Send OTP
-    res = client.post("/api/onboarding/send-otp", json={"mobile_number": "9998887771"})
-    assert res.status_code == 200
-    assert res.json()["status"] == 1
-    assert res.json()["data"]["otp"] == "1234"
-    
-    # 2. Verify OTP
-    verify_res = client.post("/api/onboarding/verify-otp", json={"mobile_number": "9998887771", "otp": "1234"})
-    assert verify_res.status_code == 200
-    assert verify_res.json()["status"] == 1
-    assert verify_res.json()["data"]["verified"] is True
+    db = SessionLocal()
+    try:
+        with patch("app.api.v1.mobile.onboarding.send_sms_otp", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = (True, "OTP sent successfully")
+            # 1. Send OTP
+            res = client.post("/api/onboarding/send-otp", json={"mobile_number": "9998887771"})
+            assert res.status_code == 200
+            assert res.json()["status"] == 1
+            assert "otp" not in res.json().get("data", {})
+            
+            otp_entry = db.query(OtpVerification).filter_by(mobile_number="9998887771").first()
+            assert otp_entry is not None
+            actual_otp = otp_entry.otp_code
+            
+            # 2. Verify OTP
+            verify_res = client.post("/api/onboarding/verify-otp", json={"mobile_number": "9998887771", "otp": actual_otp})
+            assert verify_res.status_code == 200
+            assert verify_res.json()["status"] == 1
+            assert verify_res.json()["data"]["verified"] is True
+    finally:
+        db.close()
 
 def test_onboarding_register_flat_society_and_auto_flats():
     mobile = "9876500001"
@@ -206,8 +220,12 @@ def test_chairman_add_member_and_code_resolution():
     assert len(by_code_res.json()["data"]["blocks"]) == 1
 
     # 4. Member submits join request
-    join_token_res = client.post("/api/onboarding/verify-otp", json={"mobile_number": "9876543210", "otp": "1234"})
-    member_token = join_token_res.json()["data"]["token"]
+    member_token = create_access_token(
+        subject="temp_9876543210",
+        role="resident",
+        society_id=None,
+        user_type=1
+    )
     join_res = client.post(
         "/api/society/join-request",
         json={

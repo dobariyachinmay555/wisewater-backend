@@ -9,26 +9,61 @@ def test_health_check():
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
 
+from unittest.mock import patch, AsyncMock
+from app.core.database import SessionLocal
+from app.models.otp import OtpVerification
+from app.core.security import create_access_token
+from app.models.user import User
+
+def get_test_token(mobile_number: str, user_type: int = 1) -> str:
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.mobile_number == mobile_number).first()
+        if user:
+            return create_access_token(
+                subject=user.id,
+                role="resident" if user.user_type == 1 else "admin",
+                society_id=user.society_id,
+                user_type=user.user_type
+            )
+        return create_access_token(
+            subject=f"temp_{mobile_number}",
+            role="admin" if user_type == 3 else "resident",
+            society_id=None,
+            user_type=user_type
+        )
+    finally:
+        db.close()
+
 def test_mobile_send_and_verify_otp():
-    # 1. Send OTP
-    send_res = client.post("/api/send-otp", json={"mobile_number": "9999988888", "device_type": "1"})
-    assert send_res.status_code == 200
-    assert send_res.json()["status"] == 1
-    otp = send_res.json()["data"].get("otp") or "1234"
-    
-    # 2. Verify OTP
-    verify_res = client.post("/api/verify-otp", json={"mobile_number": "9999988888", "otp": otp, "user_type": 3})
-    assert verify_res.status_code == 200
-    assert verify_res.json()["status"] == 1
-    data = verify_res.json()["data"]
-    assert "token" in data
-    assert data["user_details"]["mobile_number"] == "9999988888"
-    assert data["user_details"]["user_type"] == 3  # Chairman
+    db = SessionLocal()
+    try:
+        with patch("app.api.v1.mobile.auth.send_sms_otp", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = (True, "OTP sent successfully")
+            # 1. Send OTP
+            send_res = client.post("/api/send-otp", json={"mobile_number": "9999988888", "device_type": "1"})
+            assert send_res.status_code == 200
+            assert send_res.json()["status"] == 1
+            assert "otp" not in send_res.json().get("data", {})
+            
+            otp_entry = db.query(OtpVerification).filter_by(mobile_number="9999988888").first()
+            assert otp_entry is not None
+            otp = otp_entry.otp_code
+            
+            # 2. Verify OTP
+            verify_res = client.post("/api/verify-otp", json={"mobile_number": "9999988888", "otp": otp, "user_type": 3})
+            assert verify_res.status_code == 200
+            assert verify_res.json()["status"] == 1
+            data = verify_res.json()["data"]
+            assert "token" in data
+            assert data["user_details"]["mobile_number"] == "9999988888"
+            assert data["user_details"]["user_type"] == 3  # Chairman
+    finally:
+        db.close()
 
 def test_mobile_profile_and_societies():
     # Login to get valid token
-    login_res = client.post("/api/verify-otp", json={"mobile_number": "9800000000", "otp": "1234", "user_type": 3})
-    token = login_res.json()["data"]["token"]
+    token = get_test_token("9800000000", user_type=3)
     headers = {"Authorization": f"Bearer {token}"}
 
     # Get profile
@@ -54,8 +89,7 @@ def test_mobile_profile_and_societies():
     assert blocks_res.json()["status"] == 1
 
 def test_mobile_readings_and_billing():
-    login_res = client.post("/api/verify-otp", json={"mobile_number": "9800000001", "otp": "1234"})
-    token = login_res.json()["data"]["token"]
+    token = get_test_token("9800000001", user_type=1)
     headers = {"Authorization": f"Bearer {token}"}
 
     readings_res = client.get("/api/get-unit-readings", headers=headers)

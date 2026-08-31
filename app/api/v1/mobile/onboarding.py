@@ -1,5 +1,6 @@
 import random
 import string
+import secrets
 from datetime import datetime, timezone, timedelta
 from typing import Optional, List, Any
 from fastapi import APIRouter, Depends, HTTPException, Request, status
@@ -7,6 +8,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 
 from app.core.database import get_db
+from app.core.config import settings
 from app.core.security import create_access_token
 from app.models.society import Society, Block, Flat, House
 from app.models.user import User
@@ -20,6 +22,7 @@ from app.schemas.mobile import (
 )
 from app.api.v1.mobile.deps import get_current_mobile_user, format_user_details
 from app.services.audit_service import record_audit_log
+from app.services.sms_service import send_sms_otp, generate_otp, normalize_indian_mobile
 
 router = APIRouter()
 
@@ -30,12 +33,14 @@ async def send_onboarding_otp(request: Request, db: Session = Depends(get_db)):
     except Exception:
         body = {}
         
-    mobile = str(body.get("mobile_number") or body.get("phone_number") or "").strip()
-    if not mobile or len(mobile) < 10:
-        return MobileApiResponse(status=0, message="Please enter a valid 10-digit mobile number", data={})
+    raw_mobile = str(body.get("mobile_number") or body.get("phone_number") or "").strip()
+    mobile = normalize_indian_mobile(raw_mobile)
+    if not mobile:
+        return MobileApiResponse(status=0, message="Please enter a valid 10-digit Indian mobile number", data={})
         
-    otp_code = "1234"
-    expires_at = datetime.now(timezone.utc) + timedelta(minutes=10)
+    otp_code = generate_otp(length=6)
+    now_utc = datetime.now(timezone.utc)
+    expires_at = now_utc + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
     
     otp_entry = db.query(OtpVerification).filter(OtpVerification.mobile_number == mobile).first()
     if not otp_entry:
@@ -52,12 +57,23 @@ async def send_onboarding_otp(request: Request, db: Session = Depends(get_db)):
         otp_entry.expires_at = expires_at
         otp_entry.attempts = 0
         otp_entry.is_verified = False
+        otp_entry.created_at = now_utc
     db.commit()
+    
+    sms_sent, msg_detail = await send_sms_otp(mobile, otp_code)
+    if not sms_sent:
+        if settings.ENABLE_TEST_OTP_BYPASS:
+            return MobileApiResponse(
+                status=1,
+                message="OTP generated (test mode: use 1234)",
+                data={"mobile_number": mobile}
+            )
+        return MobileApiResponse(status=0, message=msg_detail or "Unable to send OTP. Please try again.", data={})
     
     return MobileApiResponse(
         status=1,
-        message="OTP sent successfully to registered number",
-        data={"otp": otp_code, "mobile_number": mobile, "expires_in_seconds": 600}
+        message="OTP sent successfully to registered mobile number",
+        data={"mobile_number": mobile}
     )
 
 @router.post("/onboarding/verify-otp", response_model=MobileApiResponse)
@@ -67,26 +83,53 @@ async def verify_onboarding_otp(request: Request, db: Session = Depends(get_db))
     except Exception:
         body = {}
         
-    mobile = str(body.get("mobile_number") or body.get("phone_number") or "").strip()
+    raw_mobile = str(body.get("mobile_number") or body.get("phone_number") or "").strip()
+    mobile = normalize_indian_mobile(raw_mobile)
     otp = str(body.get("otp_code") or body.get("otp") or "").strip()
     
-    if not mobile or len(mobile) < 10:
-        return MobileApiResponse(status=0, message="Please enter a valid mobile number", data={})
-    if not otp:
-        return MobileApiResponse(status=0, message="Please enter OTP", data={})
+    if not mobile:
+        return MobileApiResponse(status=0, message="Please enter a valid 10-digit Indian mobile number", data={})
         
-    otp_entry = db.query(OtpVerification).filter(OtpVerification.mobile_number == mobile).first()
-    valid_otp = (otp == "1234") or (otp_entry and otp_entry.otp_code == otp and otp_entry.expires_at > datetime.now(timezone.utc))
+    is_test_bypass = settings.ENABLE_TEST_OTP_BYPASS and (otp in ["1234", "123456"])
     
-    if not valid_otp:
-        if otp_entry:
+    if not is_test_bypass:
+        if not otp or len(otp) != 6 or not otp.isdigit():
+            return MobileApiResponse(status=0, message="Please enter a valid 6-digit OTP", data={})
+            
+        otp_entry = db.query(OtpVerification).filter(OtpVerification.mobile_number == mobile).first()
+        if not otp_entry:
+            return MobileApiResponse(status=0, message="No OTP requested for this number. Please request an OTP first.", data={})
+            
+        if otp_entry.is_verified:
+            return MobileApiResponse(status=0, message="This OTP has already been used. Please request a new OTP.", data={})
+            
+        if otp_entry.attempts >= settings.MAX_OTP_ATTEMPTS:
+            return MobileApiResponse(status=0, message="Maximum verification attempts exceeded. Please request a new OTP.", data={})
+            
+        now_utc = datetime.now(timezone.utc)
+        exp = otp_entry.expires_at
+        if exp and exp.tzinfo is None:
+            exp = exp.replace(tzinfo=timezone.utc)
+            
+        if exp and exp < now_utc:
+            return MobileApiResponse(status=0, message="OTP has expired. Please request a new OTP.", data={})
+            
+        is_match = secrets.compare_digest(otp_entry.otp_code, otp)
+        if not is_match:
             otp_entry.attempts += 1
             db.commit()
-        return MobileApiResponse(status=0, message="Invalid or expired OTP", data={})
-        
-    if otp_entry:
+            remaining = settings.MAX_OTP_ATTEMPTS - otp_entry.attempts
+            if remaining <= 0:
+                return MobileApiResponse(status=0, message="Maximum verification attempts exceeded. Please request a new OTP.", data={})
+            return MobileApiResponse(status=0, message=f"Invalid OTP. {remaining} attempt{'s' if remaining > 1 else ''} remaining.", data={})
+            
         otp_entry.is_verified = True
         db.commit()
+    else:
+        otp_entry = db.query(OtpVerification).filter(OtpVerification.mobile_number == mobile).first()
+        if otp_entry:
+            otp_entry.is_verified = True
+            db.commit()
         
     user = db.query(User).filter(User.mobile_number == mobile).first()
     token = None

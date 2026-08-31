@@ -7,7 +7,7 @@ class OtpVerification(Base):
     
     id = Column(Integer, primary_key=True, autoincrement=True)
     mobile_number = Column(String(20), nullable=False, index=True)
-    otp_code = Column(String(10), nullable=False)
+    otp_code = Column(String(128), nullable=False)
     expires_at = Column(DateTime, nullable=False)
     attempts = Column(Integer, default=0)
     is_verified = Column(Boolean, default=False)
