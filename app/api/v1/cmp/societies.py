@@ -9,6 +9,7 @@ from app.models.user import User
 from app.models.meter import Meter
 from app.models.reading import MeterReading
 from app.models.billing import Bill
+from app.models.audit import AuditLog
 from app.schemas.cmp import CreateSocietyRequest, UpdateSocietyRequest, AdminTransferChairmanRequest
 from app.api.v1.cmp.deps import get_current_staff, require_roles
 from app.services.audit_service import record_audit_log
@@ -234,6 +235,96 @@ def get_society_details(
         "blocks": blocks,
         "houses": houses,
         "residents": residents_data
+    }
+
+@router.get("/{id}/member-history")
+def get_society_member_history(
+    id: int,
+    search: Optional[str] = Query(None),
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=100),
+    current_staff = Depends(get_current_staff),
+    db: Session = Depends(get_db)
+):
+    """Retrieve complete member change/removal history for a specific society."""
+    s = db.query(Society).filter(Society.id == id).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Society not found")
+        
+    query = db.query(AuditLog).filter(
+        AuditLog.society_id == id,
+        AuditLog.action.in_(["MEMBER_REPLACED", "MEMBER_REMOVED", "MEMBER_FLAT_CHANGED"])
+    )
+    
+    if search and search.strip():
+        term = f"%{search.strip()}%"
+        from sqlalchemy import cast, String, or_
+        query = query.filter(
+            or_(
+                AuditLog.entity_id.ilike(term),
+                AuditLog.action.ilike(term),
+                cast(AuditLog.after_state, String).ilike(term),
+                cast(AuditLog.before_state, String).ilike(term)
+            )
+        )
+        
+    total = query.count()
+    logs = query.order_by(AuditLog.created_at.desc()).offset((page - 1) * limit).limit(limit).all()
+    
+    items = []
+    for l in logs:
+        after = l.after_state if isinstance(l.after_state, dict) else {}
+        before = l.before_state if isinstance(l.before_state, dict) else {}
+
+        old_member = after.get("old_member") or before
+        new_member = after.get("new_member")
+
+        old_member_name = old_member.get("name") if isinstance(old_member, dict) else (before.get("name") or before.get("old_member_name"))
+        old_member_mobile = old_member.get("mobile_number") if isinstance(old_member, dict) else (before.get("mobile_number") or before.get("old_member_mobile"))
+        
+        new_member_name = new_member.get("name") if isinstance(new_member, dict) else (after.get("new_member_name") or ("VACANT" if l.action == "MEMBER_REMOVED" else None))
+        new_member_mobile = new_member.get("mobile_number") if isinstance(new_member, dict) else (after.get("new_member_mobile") or ("N/A" if l.action == "MEMBER_REMOVED" else None))
+
+        flat_number = after.get("flat_number") or before.get("flat_number") or l.entity_id
+        block_title = after.get("block_title") or before.get("block_title") or ""
+        meter_reading = after.get("meter_reading") or after.get("starting_meter_reading") or before.get("final_meter_reading")
+        new_starting_reading = after.get("new_starting_reading") or meter_reading
+        performed_by_name = after.get("performed_by_name") or l.actor_email or "Administrator"
+        performed_by_role = after.get("performed_by_role") or ("Chairman" if l.actor_type == "USER" else l.actor_type)
+        reason = after.get("reason") or "N/A"
+
+        change_summary = ""
+        if l.action == "MEMBER_REPLACED":
+            change_summary = f"{old_member_name or 'Old Member'} → {new_member_name or 'New Member'}"
+        elif l.action == "MEMBER_REMOVED":
+            change_summary = f"{old_member_name or 'Old Member'} → VACANT"
+        elif l.action == "MEMBER_FLAT_CHANGED":
+            change_summary = f"{old_member_name or 'Member'} moved flat to {flat_number}"
+
+        items.append({
+            "id": l.id,
+            "action": l.action,
+            "created_at": l.created_at.strftime("%Y-%m-%d %H:%M:%S") if l.created_at else "",
+            "formatted_date": l.created_at.strftime("%d %b %Y, %I:%M %p") if l.created_at else "",
+            "change_summary": change_summary,
+            "old_member_name": old_member_name,
+            "old_member_mobile": old_member_mobile,
+            "new_member_name": new_member_name,
+            "new_member_mobile": new_member_mobile,
+            "flat_number": flat_number,
+            "block_title": block_title,
+            "meter_reading": meter_reading,
+            "new_starting_reading": new_starting_reading,
+            "performed_by_name": performed_by_name,
+            "performed_by_role": performed_by_role,
+            "reason": reason
+        })
+        
+    return {
+        "items": items,
+        "total": total,
+        "page": page,
+        "limit": limit
     }
 
 @router.patch("/{id}/status")

@@ -14,7 +14,8 @@ def record_audit_log(
     before_state: Optional[Dict[str, Any]] = None,
     after_state: Optional[Dict[str, Any]] = None,
     ip_address: Optional[str] = None,
-    user_agent: Optional[str] = None
+    user_agent: Optional[str] = None,
+    commit: bool = True
 ) -> AuditLog:
     """Record an immutable audit log entry."""
     log = AuditLog(
@@ -31,6 +32,9 @@ def record_audit_log(
         user_agent=user_agent
     )
     db.add(log)
-    db.commit()
-    db.refresh(log)
+    if commit:
+        db.commit()
+        db.refresh(log)
+    else:
+        db.flush()
     return log

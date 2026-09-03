@@ -1547,12 +1547,13 @@ async def replace_society_member(
             from app.services.notification_service import send_user_notification
             society = db.query(Society).filter(Society.id == soc_id).first()
             soc_name = society.name if society else "the society"
+            actor_title = "the Chairman" if current_user.user_type == 3 else ("the Society Secretary" if current_user.user_type == 2 else "the Administration")
 
             send_user_notification(
                 db=db,
                 user_id=old_member.id,
                 title="Removed from Society",
-                message=f"You have been removed from {soc_name} by the Chairman.",
+                message=f"You have been removed from {soc_name} by {actor_title}.",
                 notification_type="REMOVED_FROM_SOCIETY",
                 data={
                     "type": "REMOVED_FROM_SOCIETY",
@@ -1621,28 +1622,67 @@ async def replace_society_member(
         )
         db.add(new_occ)
 
-        # 6. Audit Logging
-        after_state = {
-            "new_member_id": new_user.id,
-            "new_member_name": new_user.name,
-            "new_member_mobile": new_user.mobile_number,
-            "flat_number": flat_num,
+        # 6. Audit Logging for Company Master Panel (CMP)
+        actor_role = "Chairman" if current_user.user_type == 3 else ("Society Secretary" if current_user.user_type == 2 else "CMP Staff")
+        block = db.query(Block).filter(Block.id == blk_id).first() if blk_id else None
+        block_title = block.title if block else "N/A"
+        society = db.query(Society).filter(Society.id == soc_id).first()
+        soc_name = society.name if society else "N/A"
+
+        old_member_info = {
+            "user_id": old_member.id,
+            "name": old_member.name,
+            "mobile_number": old_member.mobile_number,
+            "society_id": soc_id,
+            "society_name": soc_name,
             "block_id": blk_id,
-            "starting_meter_reading": current_meter_reading,
-            "reason": payload.reason
+            "block_title": block_title,
+            "flat_number": flat_num
+        }
+
+        new_member_info = {
+            "user_id": new_user.id,
+            "name": new_user.name,
+            "mobile_number": new_user.mobile_number,
+            "society_id": soc_id,
+            "society_name": soc_name,
+            "block_id": blk_id,
+            "block_title": block_title,
+            "flat_number": flat_num
+        }
+
+        after_state = {
+            "action": "MEMBER_REPLACED",
+            "society_id": soc_id,
+            "society_name": soc_name,
+            "block_id": blk_id,
+            "block_title": block_title,
+            "flat_number": flat_num,
+            "meter_id": meter.id if meter else None,
+            "meter_reading": current_meter_reading,
+            "new_starting_reading": current_meter_reading,
+            "reason": payload.reason or "Resident replaced",
+            "performed_by_id": current_user.id,
+            "performed_by_name": current_user.name,
+            "performed_by_role": actor_role,
+            "status": "COMPLETED",
+            "change_summary": f"{old_member.name} → {new_user.name}",
+            "old_member": old_member_info,
+            "new_member": new_member_info
         }
 
         record_audit_log(
             db=db,
             actor_type="USER",
             actor_id=str(current_user.id),
-            actor_email=current_user.email,
+            actor_email=current_user.email or current_user.mobile_number,
             action="MEMBER_REPLACED",
             entity_type="FLAT",
             entity_id=f"{blk_id}-{flat_num}",
             society_id=soc_id,
-            before_state=before_state,
-            after_state=after_state
+            before_state=old_member_info,
+            after_state=after_state,
+            commit=False
         )
 
         db.commit()
@@ -1768,12 +1808,13 @@ def remove_society_member(
             from app.services.notification_service import send_user_notification
             society = db.query(Society).filter(Society.id == soc_id).first()
             soc_name = society.name if society else "the society"
+            actor_title = "the Chairman" if current_user.user_type == 3 else ("the Society Secretary" if current_user.user_type == 2 else "the Administration")
 
             send_user_notification(
                 db=db,
                 user_id=member.id,
                 title="Removed from Society",
-                message=f"You have been removed from {soc_name} by the Chairman.",
+                message=f"You have been removed from {soc_name} by {actor_title}.",
                 notification_type="REMOVED_FROM_SOCIETY",
                 data={
                     "type": "REMOVED_FROM_SOCIETY",
@@ -1792,18 +1833,66 @@ def remove_society_member(
         member.approval_status = 0
         member.fcm_token = None
 
-        # Audit log
+        # Audit Logging for Company Master Panel (CMP)
+        actor_role = "Chairman" if current_user.user_type == 3 else ("Society Secretary" if current_user.user_type == 2 else "CMP Staff")
+        block = db.query(Block).filter(Block.id == blk_id).first() if blk_id else None
+        block_title = block.title if block else "N/A"
+        society = db.query(Society).filter(Society.id == soc_id).first()
+        soc_name = society.name if society else "N/A"
+
+        old_member_info = {
+            "user_id": member.id,
+            "name": member.name,
+            "mobile_number": member.mobile_number,
+            "society_id": soc_id,
+            "society_name": soc_name,
+            "block_id": blk_id,
+            "block_title": block_title,
+            "flat_number": flat_num
+        }
+
+        new_member_info = {
+            "user_id": None,
+            "name": "VACANT",
+            "mobile_number": "N/A",
+            "society_id": soc_id,
+            "society_name": soc_name,
+            "block_id": blk_id,
+            "block_title": block_title,
+            "flat_number": flat_num
+        }
+
+        after_state = {
+            "action": "MEMBER_REMOVED",
+            "society_id": soc_id,
+            "society_name": soc_name,
+            "block_id": blk_id,
+            "block_title": block_title,
+            "flat_number": flat_num,
+            "meter_id": meter.id if meter else None,
+            "meter_reading": current_meter_reading,
+            "reason": reason,
+            "performed_by_id": current_user.id,
+            "performed_by_name": current_user.name,
+            "performed_by_role": actor_role,
+            "status": "COMPLETED",
+            "change_summary": f"{member.name} → VACANT",
+            "old_member": old_member_info,
+            "new_member": new_member_info
+        }
+
         record_audit_log(
             db=db,
             actor_type="USER",
             actor_id=str(current_user.id),
-            actor_email=current_user.email,
+            actor_email=current_user.email or current_user.mobile_number,
             action="MEMBER_REMOVED",
             entity_type="FLAT",
             entity_id=f"{blk_id}-{flat_num}" if (blk_id and flat_num) else str(member.id),
             society_id=soc_id,
-            before_state={"member_id": member.id, "name": member.name, "flat": flat_num},
-            after_state={"member_id": member.id, "status": "REMOVED", "reason": reason}
+            before_state=old_member_info,
+            after_state=after_state,
+            commit=False
         )
 
         db.commit()

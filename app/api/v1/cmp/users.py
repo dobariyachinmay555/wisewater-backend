@@ -14,6 +14,7 @@ def list_users(
     search: Optional[str] = Query(None),
     society_id: Optional[int] = Query(None),
     user_type: Optional[int] = Query(None),
+    unassigned_only: Optional[bool] = Query(None),
     page: int = Query(1, ge=1),
     limit: int = Query(20, ge=1, le=100),
     current_staff = Depends(get_current_staff),
@@ -26,6 +27,8 @@ def list_users(
         query = query.filter(User.society_id == society_id)
     if user_type:
         query = query.filter(User.user_type == user_type)
+    if unassigned_only is True:
+        query = query.filter(User.society_id.is_(None))
         
     if search and search.strip():
         term = f"%{search.strip()}%"
@@ -41,6 +44,7 @@ def list_users(
     
     items = []
     for u in users:
+        is_unassigned = u.society_id is None
         items.append({
             "id": u.id,
             "name": u.name,
@@ -48,9 +52,11 @@ def list_users(
             "email": u.email or "N/A",
             "user_type": u.user_type,
             "role_name": "Chairman" if u.user_type == 3 else ("Committee Admin" if u.user_type == 2 else "Resident"),
+            "society_id": u.society_id,
             "society_name": u.society.name if u.society else "Unassigned",
             "block_title": u.block.title if u.block else "N/A",
             "flat_number": u.flat_number or "N/A",
+            "is_unassigned": is_unassigned,
             "approval_status": u.approval_status,
             "previous_unit": u.previous_unit,
             "is_active": u.is_active,
