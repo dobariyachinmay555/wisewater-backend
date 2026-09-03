@@ -986,9 +986,15 @@ async def complete_chairman_transfer(
                 db=db,
                 society_id=soc_id,
                 sender_id=candidate_user.id,
-                title="Chairman Leadership Update",
-                message=f"Chairman responsibilities for {society.name} have been handed over to {candidate_user.name}.",
-                notification_type="ANNOUNCEMENT"
+                title="Chairman Changed",
+                message=f"The Chairman of {society.name} has been changed to {candidate_user.name}.",
+                notification_type="ANNOUNCEMENT",
+                data={
+                    "type": "CHAIRMAN_CHANGED",
+                    "society_id": str(soc_id),
+                    "new_chairman_name": candidate_user.name,
+                    "new_chairman_id": str(candidate_user.id)
+                }
             )
         except Exception as notif_err:
             print(f"[TRANSFER NOTIF NOTE] Broadcast notice skipped: {notif_err}")

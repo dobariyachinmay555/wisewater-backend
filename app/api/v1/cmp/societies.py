@@ -561,7 +561,7 @@ def request_changes_society_registration(
     return {"status": 1, "message": "Changes requested successfully", "notes": notes}
 
 @router.post("/{id}/transfer-chairman")
-def admin_transfer_chairman(
+async def admin_transfer_chairman(
     id: int,
     payload: AdminTransferChairmanRequest,
     current_staff = Depends(require_roles(["OWNER", "SUPER_ADMIN", "ADMIN"])),
@@ -667,6 +667,26 @@ def admin_transfer_chairman(
     db.commit()
     db.refresh(society)
     db.refresh(candidate_user)
+
+    # Send broadcast notice to society members regarding new Chairman
+    try:
+        from app.services.notification_service import broadcast_society_notification
+        await broadcast_society_notification(
+            db=db,
+            society_id=society.id,
+            sender_id=candidate_user.id,
+            title="Chairman Changed",
+            message=f"The Chairman of {society.name} has been changed to {new_name}.",
+            notification_type="ANNOUNCEMENT",
+            data={
+                "type": "CHAIRMAN_CHANGED",
+                "society_id": str(society.id),
+                "new_chairman_name": new_name,
+                "new_chairman_id": str(candidate_user.id)
+            }
+        )
+    except Exception as notif_err:
+        print(f"[CMP TRANSFER NOTIF NOTE] Broadcast notice skipped: {notif_err}")
 
     return {
         "status": 1,
