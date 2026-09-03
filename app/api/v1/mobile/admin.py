@@ -26,7 +26,10 @@ def update_unit_price(
     except ValueError:
         return MobileApiResponse(status=0, message="Invalid unit price", data={})
         
-    soc_id = current_user.society_id or 1
+    db.refresh(current_user)
+    if not current_user.society_id:
+        return MobileApiResponse(status=0, message="You are not associated with any society", data={})
+    soc_id = current_user.society_id
     society = db.query(Society).filter(Society.id == soc_id).first()
     if not society:
         return MobileApiResponse(status=0, message="Society not found", data={})
@@ -41,7 +44,10 @@ def get_pending_requests(
     db: Session = Depends(get_db)
 ):
     """Get pending resident join requests for society admin review."""
-    soc_id = current_user.society_id or 1
+    db.refresh(current_user)
+    if not current_user.society_id:
+        return MobileApiResponse(status=0, message="You are not associated with any society", data=[])
+    soc_id = current_user.society_id
     pending_users = db.query(User).filter(
         User.society_id == soc_id,
         User.approval_status == 0
@@ -116,7 +122,10 @@ def get_pending_reading_requests(
     db: Session = Depends(get_db)
 ):
     """Get pending meter readings submitted by residents."""
-    soc_id = current_user.society_id or 1
+    db.refresh(current_user)
+    if not current_user.society_id:
+        return MobileApiResponse(status=0, message="You are not associated with any society", data=[])
+    soc_id = current_user.society_id
     query = db.query(MeterReading).join(User, MeterReading.user_id == User.id).filter(
         MeterReading.society_id == soc_id,
         MeterReading.status == 0,  # Pending

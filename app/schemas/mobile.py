@@ -212,4 +212,9 @@ class ChairmanReplaceMemberRequest(BaseModel):
     deactivate_old_member: Optional[bool] = False
     reason: Optional[str] = "Resident replaced"
 
+class ChairmanRemoveMemberRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    reason: Optional[str] = "Removed by Chairman"
+
+
 

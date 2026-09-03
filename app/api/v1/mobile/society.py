@@ -87,7 +87,10 @@ def get_apartment_blocks(
     db: Session = Depends(get_db)
 ):
     """Get all blocks for the authenticated user's society."""
-    soc_id = current_user.society_id or 1
+    db.refresh(current_user)
+    if not current_user.society_id:
+        return MobileApiResponse(status=0, message="You are not a member of any society", data=[])
+    soc_id = current_user.society_id
     blocks = db.query(Block).filter(Block.society_id == soc_id).all()
     result = [
         {"id": b.id, "block_id": b.id, "title": b.title, "total_flats": b.total_flats}
@@ -117,7 +120,10 @@ def get_block_users(
     db: Session = Depends(get_db)
 ):
     """Get all residents inside a specific block or entire society."""
-    soc_id = current_user.society_id or 1
+    db.refresh(current_user)
+    if not current_user.society_id:
+        return MobileApiResponse(status=0, message="You are not a member of any society", data=[])
+    soc_id = current_user.society_id
     query = db.query(User).filter(
         User.society_id == soc_id,
         User.is_active == True,

@@ -25,7 +25,8 @@ from app.schemas.mobile import (
     CancelChairmanTransferRequest,
     ChairmanUpdateMemberRequest,
     ChairmanChangeFlatRequest,
-    ChairmanReplaceMemberRequest
+    ChairmanReplaceMemberRequest,
+    ChairmanRemoveMemberRequest
 )
 from app.api.v1.mobile.deps import get_current_mobile_user, format_user_details, require_chairman_user
 from app.services.audit_service import record_audit_log
@@ -1541,12 +1542,33 @@ async def replace_society_member(
             "final_meter_reading": current_meter_reading
         }
 
-        # Clear flat assignment and mark old resident as inactive member of society
-        old_member.flat_number = None
-        old_member.block_id = None
-        old_member.is_active = False
+        # Send removal notification to old resident before clearing attributes
+        try:
+            from app.services.notification_service import send_user_notification
+            society = db.query(Society).filter(Society.id == soc_id).first()
+            soc_name = society.name if society else "the society"
 
-        # Clear old member's FCM token so future flat notifications are stopped
+            send_user_notification(
+                db=db,
+                user_id=old_member.id,
+                title="Removed from Society",
+                message=f"You have been removed from {soc_name} by the Chairman.",
+                notification_type="REMOVED_FROM_SOCIETY",
+                data={
+                    "type": "REMOVED_FROM_SOCIETY",
+                    "society_name": soc_name
+                },
+                sender_id=current_user.id
+            )
+        except Exception as notif_err:
+            logger.warning(f"Error sending removal notification: {notif_err}")
+
+        # Completely dissociate old resident from the society
+        old_member.society_id = None
+        old_member.block_id = None
+        old_member.flat_number = None
+        old_member.is_active = False
+        old_member.approval_status = 0
         old_member.fcm_token = None
 
         # 3. Handle Incoming Resident (Amit)
@@ -1641,18 +1663,7 @@ async def replace_society_member(
                 sender_id=current_user.id
             )
 
-            # B. Old Member Notification (if still active in database)
-            if old_member.is_active:
-                send_user_notification(
-                    db=db,
-                    user_id=old_member.id,
-                    title="Residency Concluded",
-                    message=f"Your active occupancy for Flat {flat_num} has concluded. Your historical billing and reading records remain safely accessible in your account.",
-                    notification_type="ANNOUNCEMENT",
-                    sender_id=current_user.id
-                )
-
-            # C. Chairman Confirmation
+            # B. Chairman Confirmation
             send_user_notification(
                 db=db,
                 user_id=current_user.id,
@@ -1666,16 +1677,148 @@ async def replace_society_member(
 
         return MobileApiResponse(
             status=1,
-            message=f"Resident for Flat {flat_num} successfully changed to {new_user.name} 🎉",
+            message="Resident replaced successfully",
             data={
-                "flat_number": flat_num,
-                "old_member_name": old_member.name,
+                "old_member_id": old_member.id,
+                "new_member_id": new_user.id,
                 "new_member_name": new_user.name,
-                "new_member_mobile": new_user.mobile_number,
-                "meter_reading_baseline": current_meter_reading
+                "flat_number": flat_num,
+                "starting_reading": current_meter_reading
             }
         )
+
     except Exception as e:
         db.rollback()
-        return MobileApiResponse(status=0, message=f"Member replacement failed: {str(e)}", data={})
+        logger.error(f"Error replacing member: {e}", exc_info=True)
+        return MobileApiResponse(status=0, message=f"Failed to replace resident: {str(e)}", data={})
+
+
+@router.post("/chairman/members/{member_id}/remove", response_model=MobileApiResponse)
+@router.post("/members/{member_id}/remove", response_model=MobileApiResponse)
+@router.delete("/chairman/members/{member_id}", response_model=MobileApiResponse)
+@router.delete("/members/{member_id}", response_model=MobileApiResponse)
+def remove_society_member(
+    member_id: int,
+    payload: Optional[ChairmanRemoveMemberRequest] = None,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Remove an existing resident from the society and vacate the flat without immediate replacement.
+    - Sets resident's society_id = None, block_id = None, flat_number = None, is_active = False, approval_status = 0.
+    - Preserves all historical readings, bills, and payments permanently.
+    - Closes FlatOccupancyHistory record.
+    - Sends 'Removed from Society' notification to the resident.
+    """
+    now_utc = datetime.now(timezone.utc)
+    soc_id = current_user.society_id
+
+    member = db.query(User).filter(User.id == member_id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found")
+
+    if member.society_id != soc_id:
+        raise HTTPException(status_code=403, detail="Member does not belong to your society")
+
+    if member.user_type == 3:
+        return MobileApiResponse(status=0, message="Cannot remove the Chairman. Please use Chairman Transfer flow.", data={})
+
+    flat_num = member.flat_number
+    blk_id = member.block_id
+    reason = payload.reason if payload and payload.reason else "Removed by Chairman"
+
+    try:
+        # Find physical meter for this flat
+        meter = None
+        current_meter_reading = member.previous_unit or 0
+        if flat_num and blk_id:
+            meter = db.query(Meter).filter(
+                Meter.society_id == soc_id,
+                Meter.block_id == blk_id,
+                Meter.flat_number == flat_num
+            ).first()
+
+            latest_approved_reading = db.query(MeterReading).filter(
+                MeterReading.user_id == member.id,
+                MeterReading.status == 1
+            ).order_by(MeterReading.current_unit.desc(), MeterReading.id.desc()).first()
+
+            if meter and meter.current_reading and meter.current_reading > 0:
+                current_meter_reading = meter.current_reading
+            elif latest_approved_reading and latest_approved_reading.current_unit > 0:
+                current_meter_reading = latest_approved_reading.current_unit
+
+            if meter:
+                meter.user_id = None  # Unlink occupant from physical meter, meter stays in flat
+
+        # Close current occupancy history
+        curr_occ = db.query(FlatOccupancyHistory).filter(
+            FlatOccupancyHistory.user_id == member.id,
+            FlatOccupancyHistory.is_current == True
+        ).first()
+
+        if curr_occ:
+            curr_occ.is_current = False
+            curr_occ.end_date = now_utc
+            curr_occ.end_meter_reading = current_meter_reading
+            curr_occ.move_out_reason = reason
+
+        # Send removal notification to resident BEFORE clearing attributes
+        try:
+            from app.services.notification_service import send_user_notification
+            society = db.query(Society).filter(Society.id == soc_id).first()
+            soc_name = society.name if society else "the society"
+
+            send_user_notification(
+                db=db,
+                user_id=member.id,
+                title="Removed from Society",
+                message=f"You have been removed from {soc_name} by the Chairman.",
+                notification_type="REMOVED_FROM_SOCIETY",
+                data={
+                    "type": "REMOVED_FROM_SOCIETY",
+                    "society_name": soc_name
+                },
+                sender_id=current_user.id
+            )
+        except Exception as notif_err:
+            logger.warning(f"Error sending removal notification: {notif_err}")
+
+        # Completely dissociate resident from society (Preserve historical readings, bills, and payments!)
+        member.society_id = None
+        member.block_id = None
+        member.flat_number = None
+        member.is_active = False
+        member.approval_status = 0
+        member.fcm_token = None
+
+        # Audit log
+        record_audit_log(
+            db=db,
+            actor_type="USER",
+            actor_id=str(current_user.id),
+            actor_email=current_user.email,
+            action="MEMBER_REMOVED",
+            entity_type="FLAT",
+            entity_id=f"{blk_id}-{flat_num}" if (blk_id and flat_num) else str(member.id),
+            society_id=soc_id,
+            before_state={"member_id": member.id, "name": member.name, "flat": flat_num},
+            after_state={"member_id": member.id, "status": "REMOVED", "reason": reason}
+        )
+
+        db.commit()
+        db.refresh(member)
+
+        return MobileApiResponse(
+            status=1,
+            message="Resident removed from society successfully",
+            data={"member_id": member.id}
+        )
+
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error removing member: {e}", exc_info=True)
+        return MobileApiResponse(status=0, message=f"Failed to remove resident: {str(e)}", data={})
+
+
 

@@ -110,6 +110,10 @@ async def store_unit_reading(
     target_user = current_user
     if apartment_user_id and apartment_user_id.strip():
         target_user = db.query(User).filter(User.id == int(apartment_user_id)).first() or current_user
+
+    db.refresh(target_user)
+    if not target_user.society_id:
+        return MobileApiResponse(status=0, message="You are not a member of any society. Please join a society first.", data={})
         
     try:
         current_unit_val = int(unit.strip())
@@ -117,7 +121,7 @@ async def store_unit_reading(
         return MobileApiResponse(status=0, message="Invalid unit value", data={})
         
     previous_unit_val = target_user.previous_unit or 0
-    society = target_user.society or db.query(Society).filter(Society.id == (target_user.society_id or 1)).first()
+    society = target_user.society or db.query(Society).filter(Society.id == target_user.society_id).first()
     unit_price_val = float(society.unit_price) if society else 25.00
     
     # Calculate consumption and cost
@@ -245,7 +249,10 @@ def download_reading_report(
 ):
     """Download 1-Month or 6-Months water reading & consumption report in CSV format."""
     import csv
-    soc_id = current_user.society_id or 1
+    db.refresh(current_user)
+    if not current_user.society_id:
+        return MobileApiResponse(status=0, message="You are not a member of any society", data={})
+    soc_id = current_user.society_id
     society = db.query(Society).filter(Society.id == soc_id).first()
     soc_name = society.name if society else "Society"
     soc_code = society.code if society else "SOC"

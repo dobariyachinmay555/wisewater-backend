@@ -646,10 +646,126 @@ def test_replace_resident_seamless_reading_history_and_future_consumption(setup_
     assert amit_after_read.previous_unit == 280
     assert meter_final.current_reading == 280
 
-    # 7. Old Resident Historical Immutability:
+    # 7. Old Resident Complete Disassociation & Historical Immutability:
+    assert rahul_after.society_id is None
+    assert rahul_after.block_id is None
+    assert rahul_after.flat_number is None
+    assert rahul_after.is_active is False
+    assert rahul_after.approval_status == 0
+    assert rahul_after.fcm_token is None
+
     # Rahul's historical readings still have user_id == Rahul.id and were never changed!
     rahul_readings = db.query(MeterReading).filter(MeterReading.user_id == rahul_id).all()
     assert len(rahul_readings) == 2
     for rr in rahul_readings:
         assert rr.user_id == rahul_id
+
+    # 8. Verify Notification Sent to Removed Resident
+    from app.models.notification import Notification
+    removal_notif = db.query(Notification).filter(
+        Notification.user_id == rahul_id,
+        Notification.title == "Removed from Society"
+    ).first()
+    assert removal_notif is not None
+    assert "You have been removed from" in removal_notif.message
+    assert "by the Chairman" in removal_notif.message
+
+
+def test_removed_resident_profile_blocks_old_society_and_enables_rejoining(setup_scenario, db):
+    """
+    Verifies that once removed:
+    - Profile API returns apartment=None, block=None, flat_number=""
+    - Member list API (/api/apartment-block/users) returns status=0
+    - Meter reading submission returns status=0
+    - User can use existing account to submit Join Society request to a new society
+    """
+    data = setup_scenario
+    rahul = data["rahul"]
+    rahul_id = rahul.id
+    chair_token = data["chair_token"]
+
+    # Chairman removes Rahul via /api/chairman/members/{member_id}/remove
+    remove_res = client.post(
+        f"/api/chairman/members/{rahul_id}/remove",
+        headers={"Authorization": f"Bearer {chair_token}"},
+        json={"reason": "Resident moving out"}
+    )
+    assert remove_res.status_code == 200
+    assert remove_res.json()["status"] == 1
+
+    db.expire_all()
+    rahul_db = db.query(User).filter_by(id=rahul_id).first()
+    assert rahul_db.society_id is None
+    assert rahul_db.block_id is None
+    assert rahul_db.flat_number is None
+    assert rahul_db.is_active is False
+
+    # Rahul gets fresh token with mobile number
+    rahul_token = create_access_token(
+        subject=rahul_id,
+        role="resident",
+        society_id=None,
+        user_type=1
+    )
+
+    # 1. Profile API check: apartment must be None
+    profile_res = client.get(
+        "/api/profile",
+        headers={"Authorization": f"Bearer {rahul_token}"}
+    )
+    assert profile_res.status_code == 200
+    p_data = profile_res.json()["data"]
+    assert p_data["apartment"] is None
+    assert p_data["block"] is None
+    assert p_data["flat_number"] == ""
+
+    # 2. Society-scoped API check: Cannot view old society blocks or users
+    blocks_res = client.get(
+        "/api/apartment-blocks",
+        headers={"Authorization": f"Bearer {rahul_token}"}
+    )
+    assert blocks_res.status_code == 200
+    assert blocks_res.json()["status"] == 0
+    assert "You are not a member of any society" in blocks_res.json()["message"]
+
+    users_res = client.get(
+        "/api/apartment-block/users",
+        headers={"Authorization": f"Bearer {rahul_token}"}
+    )
+    assert users_res.status_code == 200
+    assert users_res.json()["status"] == 0
+
+    # 3. Submitting meter reading fails with clear message
+    reading_res = client.post(
+        "/api/store-unit-reading",
+        headers={"Authorization": f"Bearer {rahul_token}"},
+        data={"unit": "300"}
+    )
+    assert reading_res.status_code == 200
+    assert reading_res.json()["status"] == 0
+    assert "You are not a member of any society" in reading_res.json()["message"]
+
+    # 4. Reusing existing account: Rahul submits join request to another society (other_soc)
+    other_soc = data["other_soc"]
+    join_res = client.post(
+        "/api/society/join-request",
+        json={
+            "society_code": other_soc.code,
+            "mobile_number": rahul.mobile_number,
+            "name": "Rahul Sharma",
+            "flat_number": "B-505",
+            "initial_reading": 100
+        }
+    )
+    assert join_res.status_code == 200
+    assert join_res.json()["status"] == 1
+
+    # Account is successfully updated with new pending join request
+    db.expire_all()
+    rahul_rejoined = db.query(User).filter_by(id=rahul_id).first()
+    assert rahul_rejoined.society_id == other_soc.id
+    assert rahul_rejoined.flat_number == "B-505"
+    assert rahul_rejoined.approval_status == 0  # Pending approval by new chairman
+    assert rahul_rejoined.is_active is True
+
 
