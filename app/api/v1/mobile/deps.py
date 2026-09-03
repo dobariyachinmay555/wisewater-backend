@@ -83,6 +83,28 @@ def get_current_mobile_user(
         )
     return user
 
+def require_chairman_user(
+    current_user: User = Depends(get_current_mobile_user),
+    db: Session = Depends(get_db)
+) -> User:
+    """Enforces that the user currently has Chairman role in live DB and has an active society.
+    
+    This ensures that immediately upon role demotion/transfer, any old Chairman JWT
+    token loses access to Chairman APIs without waiting for JWT token expiration.
+    """
+    db.refresh(current_user)
+    if current_user.user_type != 3:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Forbidden: Only an active Chairman can access this resource"
+        )
+    if not current_user.society_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Chairman is not associated with any active society"
+        )
+    return current_user
+
 
 def resolve_media_url(raw_url: Optional[str]) -> str:
     """Normalize any image/file URL to a fully qualified live HTTPS URL."""

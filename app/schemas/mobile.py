@@ -157,3 +157,34 @@ class JoinSocietyRequest(BaseModel):
     initial_reading: Optional[int] = None
     image_url: Optional[str] = None
 
+# Chairman Transfer Request Schemas
+class InitiateChairmanTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    new_mobile_number: str
+    new_name: str
+    new_email: Optional[str] = None
+    demote_old_to_resident: Optional[bool] = True
+
+class VerifyChairmanTransferOtpRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    transfer_id: str
+    mobile_number: str
+    otp_code: str
+
+class CompleteChairmanTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    transfer_id: str
+    demote_old_to_resident: Optional[bool] = True
+
+class VerifyAndCompleteChairmanTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    transfer_id: str
+    mobile_number: str
+    otp_code: str
+    demote_old_to_resident: Optional[bool] = True
+
+class CancelChairmanTransferRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    transfer_id: str
+    reason: Optional[str] = None
+

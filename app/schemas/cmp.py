@@ -57,3 +57,10 @@ class RejectRegistrationRequest(BaseModel):
 class RequestChangesRequest(BaseModel):
     notes: str
 
+class AdminTransferChairmanRequest(BaseModel):
+    new_mobile_number: str
+    new_name: str
+    new_email: Optional[EmailStr] = None
+    demote_old_to_resident: Optional[bool] = True
+    reason: str
+

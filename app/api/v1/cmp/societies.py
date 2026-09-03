@@ -9,9 +9,10 @@ from app.models.user import User
 from app.models.meter import Meter
 from app.models.reading import MeterReading
 from app.models.billing import Bill
-from app.schemas.cmp import CreateSocietyRequest, UpdateSocietyRequest
+from app.schemas.cmp import CreateSocietyRequest, UpdateSocietyRequest, AdminTransferChairmanRequest
 from app.api.v1.cmp.deps import get_current_staff, require_roles
 from app.services.audit_service import record_audit_log
+from app.services.sms_service import normalize_indian_mobile
 
 router = APIRouter()
 
@@ -558,4 +559,122 @@ def request_changes_society_registration(
     
     db.commit()
     return {"status": 1, "message": "Changes requested successfully", "notes": notes}
+
+@router.post("/{id}/transfer-chairman")
+def admin_transfer_chairman(
+    id: int,
+    payload: AdminTransferChairmanRequest,
+    current_staff = Depends(require_roles(["OWNER", "SUPER_ADMIN", "ADMIN"])),
+    db: Session = Depends(get_db)
+):
+    """CMP Administrative Emergency Override: Transfer society Chairman.
+    
+    Used when the Chairman lost access, left without notice, or by society committee resolution.
+    Mandates an administrative reason recorded in immutable audit log.
+    """
+    society = db.query(Society).filter(Society.id == id).first()
+    if not society:
+        raise HTTPException(status_code=404, detail="Society not found")
+
+    new_mobile = normalize_indian_mobile(payload.new_mobile_number)
+    if not new_mobile:
+        raise HTTPException(status_code=400, detail="Please enter a valid 10-digit Indian mobile number")
+
+    new_name = payload.new_name.strip()
+    if len(new_name) < 2:
+        raise HTTPException(status_code=400, detail="New Chairman name must be at least 2 characters")
+
+    reason = payload.reason.strip()
+    if not reason:
+        raise HTTPException(status_code=400, detail="Administrative reason is required for Chairman transfer")
+
+    # Find existing chairman for this society
+    old_chairman = db.query(User).filter(User.society_id == society.id, User.user_type == 3).first()
+
+    # Check candidate
+    candidate_user = db.query(User).filter(User.mobile_number == new_mobile).first()
+    if candidate_user:
+        if candidate_user.user_type == 3 and candidate_user.society_id != society.id:
+            raise HTTPException(status_code=400, detail="Candidate is already Chairman of another society")
+        if candidate_user.society_id and candidate_user.society_id != society.id:
+            raise HTTPException(status_code=400, detail="Candidate belongs to another society")
+        candidate_user.name = new_name
+        if payload.new_email:
+            candidate_user.email = payload.new_email
+        candidate_user.user_type = 3
+        candidate_user.society_id = society.id
+        candidate_user.approval_status = 1
+        candidate_user.is_active = True
+    else:
+        candidate_user = User(
+            name=new_name,
+            mobile_number=new_mobile,
+            email=payload.new_email,
+            user_type=3,
+            society_id=society.id,
+            approval_status=1,
+            previous_unit=0,
+            is_active=True
+        )
+        db.add(candidate_user)
+        db.flush()
+
+    demote = payload.demote_old_to_resident if payload.demote_old_to_resident is not None else True
+    before_state = {
+        "society_id": society.id,
+        "society_name": society.name,
+        "old_chairman_id": old_chairman.id if old_chairman else None,
+        "old_chairman_name": old_chairman.name if old_chairman else society.chairman_name,
+        "old_chairman_mobile": old_chairman.mobile_number if old_chairman else society.chairman_mobile,
+    }
+
+    if old_chairman:
+        if demote:
+            old_chairman.user_type = 1
+        else:
+            old_chairman.user_type = 1
+            old_chairman.is_active = False
+
+    society.chairman_name = new_name
+    society.chairman_mobile = new_mobile
+    if payload.new_email:
+        society.chairman_email = payload.new_email
+
+    now_utc = datetime.now(timezone.utc)
+    after_state = {
+        "new_chairman_id": candidate_user.id,
+        "new_chairman_name": new_name,
+        "new_chairman_mobile": new_mobile,
+        "reason": reason,
+        "transferred_by_staff_id": current_staff.id,
+        "transferred_by_staff_email": current_staff.email,
+        "transferred_at": now_utc.isoformat()
+    }
+
+    record_audit_log(
+        db=db,
+        actor_type="STAFF",
+        actor_id=current_staff.id,
+        actor_email=current_staff.email,
+        action="ADMIN_CHAIRMAN_TRANSFERRED",
+        entity_type="SOCIETY",
+        entity_id=str(society.id),
+        society_id=society.id,
+        before_state=before_state,
+        after_state=after_state
+    )
+
+    db.commit()
+    db.refresh(society)
+    db.refresh(candidate_user)
+
+    return {
+        "status": 1,
+        "message": f"Chairman transferred to {new_name} ({new_mobile}) successfully",
+        "data": {
+            "society_id": society.id,
+            "new_chairman_name": new_name,
+            "new_chairman_mobile": new_mobile
+        }
+    }
 

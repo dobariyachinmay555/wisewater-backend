@@ -1,22 +1,31 @@
 from typing import Optional, List
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+import secrets
 from fastapi import APIRouter, Depends, Query, HTTPException, status
 from sqlalchemy.orm import Session
 from sqlalchemy import func
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.models.society import Society, Block, Flat, House
 from app.models.user import User
 from app.models.meter import Meter
 from app.models.reading import MeterReading
 from app.models.billing import Bill
+from app.models.chairman_transfer import ChairmanTransfer
 from app.schemas.mobile import (
     MobileApiResponse,
     UpdateSocietyProfileRequest,
-    AddMemberRequest
+    AddMemberRequest,
+    InitiateChairmanTransferRequest,
+    VerifyChairmanTransferOtpRequest,
+    CompleteChairmanTransferRequest,
+    VerifyAndCompleteChairmanTransferRequest,
+    CancelChairmanTransferRequest
 )
-from app.api.v1.mobile.deps import get_current_mobile_user, format_user_details
+from app.api.v1.mobile.deps import get_current_mobile_user, format_user_details, require_chairman_user
 from app.services.audit_service import record_audit_log
+from app.services.sms_service import send_sms_otp, generate_otp, normalize_indian_mobile
 
 router = APIRouter()
 
@@ -587,9 +596,6 @@ def test_fcm_push(
         body=body
     )
 
-    print(f"[TEST FCM PUSH RESULT] Status: {result.get('status')}, Message: {result.get('message')}")
-    print("=" * 60)
-
     return MobileApiResponse(
         status=result.get("status", 1),
         message=result.get("message", "FCM test completed"),
@@ -597,5 +603,461 @@ def test_fcm_push(
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# CHAIRMAN TRANSFER FLOW (SECURE 2-STEP ATOMIC HANDOFF)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/chairman/transfer/status", response_model=MobileApiResponse)
+def get_chairman_transfer_status(
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Get active or recent Chairman transfer status for this society."""
+    soc_id = current_user.society_id
+    transfer = db.query(ChairmanTransfer).filter(
+        ChairmanTransfer.society_id == soc_id,
+        ChairmanTransfer.status.in_(["PENDING_OTP", "OTP_VERIFIED"])
+    ).order_by(ChairmanTransfer.created_at.desc()).first()
+
+    if not transfer:
+        return MobileApiResponse(
+            status=1,
+            message="No active transfer in progress",
+            data={"has_active_transfer": False}
+        )
+
+    # Check if expired
+    now_utc = datetime.now(timezone.utc)
+    exp = transfer.expires_at
+    if exp and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now_utc and transfer.status == "PENDING_OTP":
+        transfer.status = "EXPIRED"
+        db.commit()
+        return MobileApiResponse(
+            status=1,
+            message="Transfer has expired",
+            data={"has_active_transfer": False, "status": "EXPIRED"}
+        )
+
+    masked_mobile = f"+91 {transfer.to_mobile_number[:2]}******{transfer.to_mobile_number[-2:]}" if len(transfer.to_mobile_number) == 10 else transfer.to_mobile_number
+    return MobileApiResponse(
+        status=1,
+        message="Active transfer in progress",
+        data={
+            "has_active_transfer": True,
+            "transfer_id": transfer.id,
+            "to_name": transfer.to_name,
+            "to_mobile_masked": masked_mobile,
+            "to_mobile_number": transfer.to_mobile_number,
+            "status": transfer.status,
+            "is_verified": transfer.is_verified,
+            "demote_old_to_resident": transfer.demote_old_to_resident,
+            "expires_at": transfer.expires_at.isoformat() if transfer.expires_at else ""
+        }
+    )
 
 
+@router.post("/chairman/transfer/initiate", response_model=MobileApiResponse)
+async def initiate_chairman_transfer(
+    payload: InitiateChairmanTransferRequest,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Step 1: Current Chairman initiates role transfer to a new candidate.
+    
+    Generates a dedicated transfer OTP dispatched directly to the candidate's mobile number.
+    Validates that the target number does not belong to another society.
+    """
+    soc_id = current_user.society_id
+    society = db.query(Society).filter(Society.id == soc_id).first()
+    if not society:
+        return MobileApiResponse(status=0, message="Society not found", data={})
+
+    raw_mobile = str(payload.new_mobile_number or "").strip()
+    new_mobile = normalize_indian_mobile(raw_mobile)
+    if not new_mobile:
+        return MobileApiResponse(status=0, message="Please enter a valid 10-digit Indian mobile number", data={})
+
+    new_name = str(payload.new_name or "").strip()
+    if not new_name or len(new_name) < 2:
+        return MobileApiResponse(status=0, message="Please enter the new Chairman's full name (at least 2 characters)", data={})
+
+    new_email = str(payload.new_email or "").strip() if payload.new_email else None
+
+    # Constraint 1: Cannot transfer to self
+    if new_mobile == current_user.mobile_number:
+        return MobileApiResponse(status=0, message="You cannot transfer Chairman responsibilities to your own current mobile number", data={})
+
+    # Constraint 2: Check target mobile in system
+    target_user = db.query(User).filter(User.mobile_number == new_mobile).first()
+    if target_user:
+        # If target user is Chairman of another society, reject
+        if target_user.user_type == 3 and target_user.society_id != soc_id:
+            other_soc = db.query(Society).filter(Society.id == target_user.society_id).first()
+            soc_title = other_soc.name if other_soc else "another society"
+            return MobileApiResponse(
+                status=0,
+                message=f"This mobile number is already registered as Chairman of '{soc_title}'. A Chairman can only manage one society.",
+                data={}
+            )
+        # If target user belongs to a different society as a Resident, reject
+        if target_user.society_id and target_user.society_id != soc_id:
+            other_soc = db.query(Society).filter(Society.id == target_user.society_id).first()
+            soc_title = other_soc.name if other_soc else "another society"
+            return MobileApiResponse(
+                status=0,
+                message=f"This user is already registered with '{soc_title}'. Cross-society transfers are not permitted.",
+                data={}
+            )
+
+    # Cancel previous pending transfers for this society
+    prev_pending = db.query(ChairmanTransfer).filter(
+        ChairmanTransfer.society_id == soc_id,
+        ChairmanTransfer.status.in_(["PENDING_OTP", "OTP_VERIFIED"])
+    ).all()
+    for p in prev_pending:
+        p.status = "CANCELLED"
+        p.cancellation_reason = "Superseded by new transfer request"
+
+    # Generate dedicated OTP for Chairman Transfer (cannot be reused elsewhere)
+    otp_code = generate_otp(length=6)
+    now_utc = datetime.now(timezone.utc)
+    expires_at = now_utc + timedelta(minutes=settings.OTP_EXPIRE_MINUTES)
+
+    transfer = ChairmanTransfer(
+        society_id=soc_id,
+        from_user_id=current_user.id,
+        to_user_id=target_user.id if target_user else None,
+        to_mobile_number=new_mobile,
+        to_name=new_name,
+        to_email=new_email,
+        otp_code=otp_code,
+        expires_at=expires_at,
+        attempts=0,
+        is_verified=False,
+        status="PENDING_OTP",
+        demote_old_to_resident=payload.demote_old_to_resident if payload.demote_old_to_resident is not None else True
+    )
+    db.add(transfer)
+    db.commit()
+    db.refresh(transfer)
+
+    # Dispatch OTP via SMS to new candidate's mobile
+    sms_sent, msg_detail = await send_sms_otp(new_mobile, otp_code)
+    masked_mobile = f"+91 {new_mobile[:2]}******{new_mobile[-2:]}"
+
+    if not sms_sent:
+        if settings.ENABLE_TEST_OTP_BYPASS:
+            return MobileApiResponse(
+                status=1,
+                message=f"Transfer OTP generated for candidate {masked_mobile} (test mode: use 1234)",
+                data={
+                    "transfer_id": transfer.id,
+                    "new_mobile_number": new_mobile,
+                    "new_name": new_name,
+                    "status": "PENDING_OTP",
+                    "expires_at": expires_at.isoformat(),
+                    "is_existing_resident": bool(target_user and target_user.society_id == soc_id)
+                }
+            )
+        return MobileApiResponse(status=0, message=msg_detail or "Unable to send SMS OTP to candidate. Please try again.", data={})
+
+    return MobileApiResponse(
+        status=1,
+        message=f"Verification OTP sent to new Chairman's mobile number: {masked_mobile}",
+        data={
+            "transfer_id": transfer.id,
+            "new_mobile_number": new_mobile,
+            "new_name": new_name,
+            "status": "PENDING_OTP",
+            "expires_at": expires_at.isoformat(),
+            "is_existing_resident": bool(target_user and target_user.society_id == soc_id)
+        }
+    )
+
+
+@router.post("/chairman/transfer/verify-otp", response_model=MobileApiResponse)
+def verify_chairman_transfer_otp(
+    payload: VerifyChairmanTransferOtpRequest,
+    db: Session = Depends(get_db)
+):
+    """Step 2: Verify OTP received by the new candidate on their own phone.
+    
+    Can be submitted by the candidate or by the Chairman entering the candidate's OTP.
+    Once verified, transfer status transitions to OTP_VERIFIED.
+    """
+    transfer = db.query(ChairmanTransfer).filter(ChairmanTransfer.id == payload.transfer_id.strip()).first()
+    if not transfer:
+        return MobileApiResponse(status=0, message="Transfer request not found", data={})
+
+    if transfer.status not in ["PENDING_OTP", "OTP_VERIFIED"]:
+        return MobileApiResponse(status=0, message=f"Transfer request is already {transfer.status.lower().replace('_', ' ')}", data={})
+
+    raw_mobile = str(payload.mobile_number or "").strip()
+    mobile = normalize_indian_mobile(raw_mobile)
+    if mobile != transfer.to_mobile_number:
+        return MobileApiResponse(status=0, message="Mobile number does not match this transfer record", data={})
+
+    # Check attempts
+    if transfer.attempts >= settings.MAX_OTP_ATTEMPTS:
+        transfer.status = "EXPIRED"
+        db.commit()
+        return MobileApiResponse(status=0, message="Maximum verification attempts exceeded. Please initiate a new transfer.", data={})
+
+    # Check expiration
+    now_utc = datetime.now(timezone.utc)
+    exp = transfer.expires_at
+    if exp and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now_utc:
+        transfer.status = "EXPIRED"
+        db.commit()
+        return MobileApiResponse(status=0, message="Transfer OTP has expired. Please initiate a new transfer.", data={})
+
+    # Validate OTP
+    otp_input = str(payload.otp_code or "").strip()
+    is_test_bypass = settings.ENABLE_TEST_OTP_BYPASS and (otp_input in ["1234", "123456"])
+    if not is_test_bypass:
+        is_match = secrets.compare_digest(transfer.otp_code, otp_input)
+        if not is_match:
+            transfer.attempts += 1
+            db.commit()
+            remaining = settings.MAX_OTP_ATTEMPTS - transfer.attempts
+            if remaining <= 0:
+                transfer.status = "EXPIRED"
+                db.commit()
+                return MobileApiResponse(status=0, message="Maximum verification attempts exceeded. Please initiate a new transfer.", data={})
+            return MobileApiResponse(status=0, message=f"Invalid OTP. {remaining} attempt{'s' if remaining > 1 else ''} remaining.", data={})
+
+    transfer.is_verified = True
+    transfer.status = "OTP_VERIFIED"
+    db.commit()
+
+    return MobileApiResponse(
+        status=1,
+        message="Candidate OTP verified successfully! Current Chairman can now confirm and complete the transfer.",
+        data={
+            "transfer_id": transfer.id,
+            "status": "OTP_VERIFIED",
+            "to_name": transfer.to_name,
+            "to_mobile_number": transfer.to_mobile_number
+        }
+    )
+
+
+@router.post("/chairman/transfer/complete", response_model=MobileApiResponse)
+async def complete_chairman_transfer(
+    payload: CompleteChairmanTransferRequest,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Step 3: Current Chairman confirms the handoff after OTP verification.
+    
+    Performs atomic transfer of Society Chairman responsibilities:
+    1. Society chairman_name/mobile/email updated.
+    2. Old Chairman demoted to Resident (or deactivated).
+    3. New Chairman promoted/created with Chairman role.
+    4. Audit trail recorded.
+    5. Old Chairman immediately loses Chairman privileges.
+    """
+    soc_id = current_user.society_id
+    transfer = db.query(ChairmanTransfer).filter(ChairmanTransfer.id == payload.transfer_id.strip()).first()
+    if not transfer:
+        return MobileApiResponse(status=0, message="Transfer request not found", data={})
+
+    if transfer.society_id != soc_id or transfer.from_user_id != current_user.id:
+        return MobileApiResponse(status=0, message="Unauthorized: You did not initiate this transfer request", data={})
+
+    if not transfer.is_verified or transfer.status != "OTP_VERIFIED":
+        return MobileApiResponse(status=0, message="Cannot complete transfer: Candidate has not yet verified OTP", data={})
+
+    # Check expiry
+    now_utc = datetime.now(timezone.utc)
+    exp = transfer.expires_at
+    if exp and exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    if exp < now_utc:
+        transfer.status = "EXPIRED"
+        db.commit()
+        return MobileApiResponse(status=0, message="Transfer session expired. Please initiate a new transfer.", data={})
+
+    society = db.query(Society).filter(Society.id == soc_id).first()
+    if not society:
+        return MobileApiResponse(status=0, message="Society not found", data={})
+
+    demote = payload.demote_old_to_resident if payload.demote_old_to_resident is not None else transfer.demote_old_to_resident
+
+    try:
+        # Find or create candidate user
+        candidate_user = db.query(User).filter(User.mobile_number == transfer.to_mobile_number).first()
+        if candidate_user:
+            # Prevent race condition: ensure not chairman of another society
+            if candidate_user.user_type == 3 and candidate_user.society_id != soc_id:
+                db.rollback()
+                return MobileApiResponse(status=0, message="Candidate is already Chairman of another society", data={})
+            if candidate_user.society_id and candidate_user.society_id != soc_id:
+                db.rollback()
+                return MobileApiResponse(status=0, message="Candidate belongs to another society", data={})
+
+            # Promote existing resident
+            candidate_user.name = transfer.to_name
+            if transfer.to_email:
+                candidate_user.email = transfer.to_email
+            candidate_user.user_type = 3
+            candidate_user.society_id = soc_id
+            candidate_user.approval_status = 1
+            candidate_user.is_active = True
+            # FCM token is untouched so their own device receives messages once active
+        else:
+            candidate_user = User(
+                name=transfer.to_name,
+                mobile_number=transfer.to_mobile_number,
+                email=transfer.to_email,
+                user_type=3,
+                society_id=soc_id,
+                approval_status=1,
+                previous_unit=0,
+                is_active=True
+            )
+            db.add(candidate_user)
+            db.flush()
+
+        # Update Old Chairman
+        before_state = {
+            "old_chairman_id": current_user.id,
+            "old_chairman_name": current_user.name,
+            "old_chairman_mobile": current_user.mobile_number,
+            "society_name": society.name,
+            "society_code": society.code,
+            "demoted_to_resident": demote
+        }
+
+        if demote:
+            current_user.user_type = 1  # Demoted to Resident
+            # Flat, block, meters, and readings stay untouched!
+        else:
+            current_user.user_type = 1
+            current_user.is_active = False
+
+        # Update Society Record
+        society.chairman_name = transfer.to_name
+        society.chairman_mobile = transfer.to_mobile_number
+        if transfer.to_email:
+            society.chairman_email = transfer.to_email
+
+        # Mark transfer complete
+        transfer.to_user_id = candidate_user.id
+        transfer.status = "COMPLETED"
+        transfer.completed_at = now_utc
+
+        # Record complete audit log
+        after_state = {
+            "new_chairman_id": candidate_user.id,
+            "new_chairman_name": candidate_user.name,
+            "new_chairman_mobile": candidate_user.mobile_number,
+            "new_chairman_email": candidate_user.email,
+            "transferred_at": now_utc.isoformat(),
+            "transfer_id": transfer.id
+        }
+
+        record_audit_log(
+            db=db,
+            actor_type="USER",
+            actor_id=str(current_user.id),
+            actor_email=current_user.email,
+            action="CHAIRMAN_TRANSFERRED",
+            entity_type="SOCIETY",
+            entity_id=str(society.id),
+            society_id=society.id,
+            before_state=before_state,
+            after_state=after_state
+        )
+
+        db.commit()
+        db.refresh(society)
+        db.refresh(current_user)
+        db.refresh(candidate_user)
+
+        # Send broadcast notice to society members regarding new Chairman
+        try:
+            from app.services.notification_service import broadcast_society_notification
+            await broadcast_society_notification(
+                db=db,
+                society_id=soc_id,
+                sender_id=candidate_user.id,
+                title="Chairman Leadership Update",
+                message=f"Chairman responsibilities for {society.name} have been handed over to {candidate_user.name}.",
+                notification_type="ANNOUNCEMENT"
+            )
+        except Exception as notif_err:
+            print(f"[TRANSFER NOTIF NOTE] Broadcast notice skipped: {notif_err}")
+
+        return MobileApiResponse(
+            status=1,
+            message=f"Chairman responsibilities for '{society.name}' successfully transferred to {candidate_user.name} 🎉",
+            data={
+                "transfer_id": transfer.id,
+                "status": "COMPLETED",
+                "new_chairman_name": candidate_user.name,
+                "new_chairman_mobile": candidate_user.mobile_number,
+                "demoted_to_resident": demote,
+                "user_details": format_user_details(current_user)
+            }
+        )
+    except Exception as e:
+        db.rollback()
+        return MobileApiResponse(status=0, message=f"Transfer execution failed: {str(e)}", data={})
+
+
+@router.post("/chairman/transfer/verify-and-complete", response_model=MobileApiResponse)
+async def verify_and_complete_chairman_transfer(
+    payload: VerifyAndCompleteChairmanTransferRequest,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Convenience Combined Endpoint: Verifies OTP and completes the transfer in a single atomic call."""
+    # First verify OTP
+    v_req = VerifyChairmanTransferOtpRequest(
+        transfer_id=payload.transfer_id,
+        mobile_number=payload.mobile_number,
+        otp_code=payload.otp_code
+    )
+    v_res = verify_chairman_transfer_otp(payload=v_req, db=db)
+    if v_res.status != 1:
+        return v_res
+
+    # Then complete transfer
+    c_req = CompleteChairmanTransferRequest(
+        transfer_id=payload.transfer_id,
+        demote_old_to_resident=payload.demote_old_to_resident
+    )
+    return await complete_chairman_transfer(payload=c_req, current_user=current_user, db=db)
+
+
+@router.post("/chairman/transfer/cancel", response_model=MobileApiResponse)
+def cancel_chairman_transfer(
+    payload: CancelChairmanTransferRequest,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Cancel an ongoing Chairman transfer request."""
+    transfer = db.query(ChairmanTransfer).filter(ChairmanTransfer.id == payload.transfer_id.strip()).first()
+    if not transfer:
+        return MobileApiResponse(status=0, message="Transfer request not found", data={})
+
+    if transfer.society_id != current_user.society_id or transfer.from_user_id != current_user.id:
+        return MobileApiResponse(status=0, message="Unauthorized to cancel this transfer", data={})
+
+    if transfer.status == "COMPLETED":
+        return MobileApiResponse(status=0, message="Cannot cancel an already completed transfer", data={})
+
+    transfer.status = "CANCELLED"
+    transfer.cancellation_reason = payload.reason or "Cancelled by Chairman"
+    db.commit()
+
+    return MobileApiResponse(
+        status=1,
+        message="Chairman transfer request cancelled successfully",
+        data={"transfer_id": transfer.id, "status": "CANCELLED"}
+    )
