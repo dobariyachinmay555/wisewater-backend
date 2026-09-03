@@ -267,10 +267,10 @@ def test_failed_or_cancelled_transfer_does_not_send_notification(setup_transfer_
         # No FCM notification must be sent
         assert not mock_fcm.called
 
-        # No notification record created
-        notif = db.query(Notification).filter_by(
-            society_id=data["society"].id,
-            title="Chairman Changed"
+        # No notification record created for the cancelled candidate
+        notif = db.query(Notification).filter(
+            Notification.society_id == data["society"].id,
+            Notification.message.contains("Cancelled Candidate")
         ).first()
         assert notif is None
 

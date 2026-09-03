@@ -165,6 +165,15 @@ def update_pending_reading_status(
         user = db.query(User).filter(User.id == reading.user_id).first()
         if user:
             user.previous_unit = reading.current_unit
+            if user.flat_number and user.society_id:
+                from app.models.meter import Meter
+                meter = db.query(Meter).filter(
+                    Meter.society_id == user.society_id,
+                    Meter.block_id == user.block_id,
+                    Meter.flat_number == user.flat_number
+                ).first()
+                if meter:
+                    meter.current_reading = reading.current_unit
         bill = generate_bill_for_reading(db, reading)
         
     db.commit()

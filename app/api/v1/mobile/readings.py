@@ -30,9 +30,31 @@ def get_unit_readings(
     if apartment_user_id and apartment_user_id > 0:
         target_user_id = apartment_user_id
     
-    readings = db.query(MeterReading).filter(
-        MeterReading.user_id == target_user_id
-    ).order_by(MeterReading.created_at.desc()).all()
+    target_user = db.query(User).filter(User.id == target_user_id).first()
+
+    # If target user has an active flat assignment, include the flat's meter reading history
+    # so reading history continues seamlessly for the incoming resident
+    if target_user and target_user.flat_number and target_user.society_id:
+        from app.models.meter import Meter
+        meter = db.query(Meter).filter(
+            Meter.society_id == target_user.society_id,
+            Meter.block_id == target_user.block_id,
+            Meter.flat_number == target_user.flat_number
+        ).first()
+
+        if meter:
+            readings = db.query(MeterReading).filter(
+                (MeterReading.user_id == target_user_id) |
+                ((MeterReading.meter_id == meter.id) & (MeterReading.society_id == target_user.society_id))
+            ).order_by(MeterReading.created_at.desc(), MeterReading.id.desc()).all()
+        else:
+            readings = db.query(MeterReading).filter(
+                MeterReading.user_id == target_user_id
+            ).order_by(MeterReading.created_at.desc(), MeterReading.id.desc()).all()
+    else:
+        readings = db.query(MeterReading).filter(
+            MeterReading.user_id == target_user_id
+        ).order_by(MeterReading.created_at.desc(), MeterReading.id.desc()).all()
     
     result = []
     for r in readings:
@@ -118,10 +140,21 @@ async def store_unit_reading(
     # Auto-approve if submitted by Admin / Chairman, else set Pending (0)
     is_admin = current_user.user_type in [2, 3]
     initial_status = 1 if is_admin else 0
+
+    # Associate reading with physical meter if available
+    meter = None
+    if target_user.flat_number and target_user.society_id:
+        from app.models.meter import Meter
+        meter = db.query(Meter).filter(
+            Meter.society_id == target_user.society_id,
+            Meter.block_id == target_user.block_id,
+            Meter.flat_number == target_user.flat_number
+        ).first()
     
     reading = MeterReading(
         society_id=target_user.society_id or (society.id if society else 1),
         user_id=target_user.id,
+        meter_id=meter.id if meter else None,
         block_id=target_user.block_id,
         previous_unit=previous_unit_val,
         current_unit=current_unit_val,
@@ -135,9 +168,11 @@ async def store_unit_reading(
     )
     db.add(reading)
     
-    # If auto-approved, update user's previous unit and generate bill
+    # If auto-approved, update user's previous unit and meter's current reading
     if initial_status == 1:
         target_user.previous_unit = current_unit_val
+        if meter:
+            meter.current_reading = current_unit_val
         generate_bill_for_reading(db, reading)
         
     db.commit()

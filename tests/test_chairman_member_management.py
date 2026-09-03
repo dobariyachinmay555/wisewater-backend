@@ -69,7 +69,7 @@ def setup_scenario(db):
         block_id=block.id,
         flat_number="A-102",
         approval_status=1,
-        previous_unit=100,
+        previous_unit=250,
         is_active=True,
         fcm_token=f"fcm_rahul_{suf}"
     )
@@ -308,6 +308,11 @@ def test_replace_member_preserves_old_readings_and_bills(setup_scenario, db):
         for b in bills:
             assert b.user_id == rahul_id  # NEVER REASSIGNED TO AMIT!
 
+        # Verify Rahul is now inactive and no longer assigned to Flat A-102
+        rahul_after = db.query(User).filter_by(id=rahul_id).first()
+        assert rahul_after.is_active is False
+        assert rahul_after.flat_number is None
+
         # 3. Verify Amit is the new active member for Flat A-102
         amit = db.query(User).filter(User.mobile_number == new_mob).first()
         assert amit is not None
@@ -520,3 +525,131 @@ def test_replace_member_sends_targeted_notifications_only(setup_scenario):
         assert not mock_broad.called
         # Targeted user notification MUST be called!
         assert mock_user_notif.called
+
+def test_replace_resident_seamless_reading_history_and_future_consumption(setup_scenario, db):
+    data = setup_scenario
+    rahul = data["rahul"]
+    rahul_id = rahul.id
+    soc_id = data["society"].id
+    block_id = data["block"].id
+    meter = data["meter"]
+
+    # At start: meter current_reading is 250, Rahul has 2 readings (r1: 180, r2: 250)
+    assert meter.current_reading == 250
+    assert rahul.previous_unit == 250
+
+    new_mob = f"997770{data['suffix']}"
+
+    # Chairman replaces Rahul with Amit Patel
+    replace_res = client.post(
+        f"/api/chairman/members/{rahul_id}/replace",
+        headers={"Authorization": f"Bearer {data['chair_token']}"},
+        json={
+            "new_name": "Amit Patel",
+            "new_mobile_number": new_mob,
+            "new_email": "amit.patel@test.com",
+            "reason": "Change of tenancy"
+        }
+    )
+    assert replace_res.status_code == 200
+    assert replace_res.json()["status"] == 1
+
+    db.expire_all()
+
+    # 1. Old Resident Verification:
+    # Inactive, flat cleared, historical records safe
+    rahul_after = db.query(User).filter_by(id=rahul_id).first()
+    assert rahul_after.is_active is False
+    assert rahul_after.flat_number is None
+
+    # Verify Rahul does NOT appear in active member list for the society
+    active_members_res = client.get(
+        "/api/apartment-block/users",
+        params={"block_id": block_id},
+        headers={"Authorization": f"Bearer {data['chair_token']}"}
+    )
+    assert active_members_res.status_code == 200
+    member_names = [m["name"] for m in active_members_res.json().get("data", [])]
+    assert rahul.name not in member_names
+    assert "Amit Patel" in member_names
+
+    # 2. New Resident Verification:
+    # Active resident of same society, block, and flat
+    amit = db.query(User).filter(User.mobile_number == new_mob).first()
+    assert amit is not None
+    assert amit.is_active is True
+    assert amit.society_id == soc_id
+    assert amit.block_id == block_id
+    assert amit.flat_number == "A-102"
+    # Starting/previous reading MUST be meter's current reading (250)
+    assert amit.previous_unit == 250
+
+    # 3. Meter Continuity:
+    # Same physical meter, current reading NOT reset (remains 250), linked to Amit
+    meter_after = db.query(Meter).filter_by(id=meter.id).first()
+    assert meter_after.user_id == amit.id
+    assert meter_after.current_reading == 250
+    assert meter_after.flat_number == "A-102"
+
+    # 4. Seamless Reading History for New Resident:
+    # Amit logs in and calls get-unit-readings
+    amit_token = create_access_token(
+        subject=amit.id,
+        role="resident",
+        society_id=soc_id,
+        user_type=1
+    )
+    amit_readings_res = client.get(
+        "/api/get-unit-readings",
+        headers={"Authorization": f"Bearer {amit_token}"}
+    )
+    assert amit_readings_res.status_code == 200
+    flat_readings = amit_readings_res.json()["data"]
+    # Amit can seamlessly see the 2 historical readings of Flat A-102 (250 and 180)
+    assert len(flat_readings) == 2
+    assert flat_readings[0]["current_unit"] == 250
+    assert flat_readings[1]["current_unit"] == 180
+
+    # 5. Future Reading under New Resident:
+    # Amit submits reading of 280 units
+    submit_res = client.post(
+        "/api/store-unit-reading",
+        headers={"Authorization": f"Bearer {amit_token}"},
+        data={"unit": "280"}
+    )
+    assert submit_res.status_code == 200
+    assert submit_res.json()["status"] == 1
+    new_reading_id = submit_res.json()["data"]["user_unit_history_id"]
+
+    # Verify consumption calculation: 280 - 250 = 30 units!
+    db.expire_all()
+    new_reading = db.query(MeterReading).filter_by(id=new_reading_id).first()
+    assert new_reading.user_id == amit.id  # Belongs to Amit!
+    assert new_reading.previous_unit == 250
+    assert new_reading.current_unit == 280
+    assert new_reading.total_unit == 30
+    assert new_reading.total_price == 30 * 25.0  # 750.0
+
+    # 6. Chairman Approves Amit's Reading:
+    approve_res = client.post(
+        "/api/pending-unit-reading-requests/update-status",
+        headers={"Authorization": f"Bearer {data['chair_token']}"},
+        json={"user_unit_history_id": new_reading_id, "status": 1}
+    )
+    assert approve_res.status_code == 200
+    assert approve_res.json()["status"] == 1
+
+    # Verify Amit's previous_unit advances to 280 and Meter advances to 280
+    db.expire_all()
+    amit_after_read = db.query(User).filter_by(id=amit.id).first()
+    meter_final = db.query(Meter).filter_by(id=meter.id).first()
+    assert amit_after_read.previous_unit == 280
+    assert meter_final.current_reading == 280
+
+    # 7. Old Resident Historical Immutability:
+    # Rahul's historical readings still have user_id == Rahul.id and were never changed!
+    rahul_readings = db.query(MeterReading).filter(MeterReading.user_id == rahul_id).all()
+    assert len(rahul_readings) == 2
+    for rr in rahul_readings:
+        assert rr.user_id == rahul_id
+

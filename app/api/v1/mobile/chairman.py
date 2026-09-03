@@ -1501,7 +1501,22 @@ async def replace_society_member(
             Meter.flat_number == flat_num
         ).first()
 
-        current_meter_reading = meter.current_reading if meter else (old_member.previous_unit or 0)
+        # Determine true last reading for this flat
+        latest_approved_reading = db.query(MeterReading).filter(
+            MeterReading.user_id == old_member.id,
+            MeterReading.status == 1
+        ).order_by(MeterReading.current_unit.desc(), MeterReading.id.desc()).first()
+
+        if meter and meter.current_reading and meter.current_reading > 0:
+            current_meter_reading = meter.current_reading
+        elif latest_approved_reading and latest_approved_reading.current_unit > 0:
+            current_meter_reading = latest_approved_reading.current_unit
+        else:
+            current_meter_reading = old_member.previous_unit or 0
+
+        # Ensure meter.current_reading matches this baseline
+        if meter:
+            meter.current_reading = current_meter_reading
 
         # 1. Close Outgoing Member's Current Occupancy
         curr_occ = db.query(FlatOccupancyHistory).filter(
@@ -1526,11 +1541,10 @@ async def replace_society_member(
             "final_meter_reading": current_meter_reading
         }
 
-        # Clear flat assignment from outgoing resident
+        # Clear flat assignment and mark old resident as inactive member of society
         old_member.flat_number = None
         old_member.block_id = None
-        if payload.deactivate_old_member:
-            old_member.is_active = False
+        old_member.is_active = False
 
         # Clear old member's FCM token so future flat notifications are stopped
         old_member.fcm_token = None
@@ -1565,10 +1579,10 @@ async def replace_society_member(
             db.add(new_user)
             db.flush()
 
-        # 4. Link Meter to New Current Resident
+        # 4. Link Meter to New Current Resident (meter.current_reading remains unchanged)
         if meter:
             meter.user_id = new_user.id
-            # meter.current_reading remains unchanged!
+            meter.current_reading = current_meter_reading
 
         # 5. Open New Occupancy History Record
         new_occ = FlatOccupancyHistory(
