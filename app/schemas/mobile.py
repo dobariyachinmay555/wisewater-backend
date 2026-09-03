@@ -188,3 +188,28 @@ class CancelChairmanTransferRequest(BaseModel):
     transfer_id: str
     reason: Optional[str] = None
 
+# Chairman Member Management Schemas
+class ChairmanUpdateMemberRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    name: Optional[str] = None
+    email: Optional[str] = None
+    mobile_number: Optional[str] = None
+    block_id: Optional[int] = None
+    flat_number: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class ChairmanChangeFlatRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    target_block_id: int
+    target_flat_number: str
+    reason: Optional[str] = None
+
+class ChairmanReplaceMemberRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+    new_name: str
+    new_mobile_number: str
+    new_email: Optional[str] = None
+    deactivate_old_member: Optional[bool] = False
+    reason: Optional[str] = "Resident replaced"
+
+

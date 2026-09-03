@@ -8,6 +8,7 @@ from app.models.audit import AuditLog
 from app.models.otp import OtpVerification
 from app.models.notification import Notification, NotificationRead
 from app.models.chairman_transfer import ChairmanTransfer
+from app.models.flat_occupancy import FlatOccupancyHistory
 
 __all__ = [
     "CompanyStaff",
@@ -25,6 +26,7 @@ __all__ = [
     "OtpVerification",
     "Notification",
     "NotificationRead",
-    "ChairmanTransfer"
+    "ChairmanTransfer",
+    "FlatOccupancyHistory"
 ]
 

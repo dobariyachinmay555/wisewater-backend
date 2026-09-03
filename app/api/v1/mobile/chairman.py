@@ -13,6 +13,7 @@ from app.models.meter import Meter
 from app.models.reading import MeterReading
 from app.models.billing import Bill
 from app.models.chairman_transfer import ChairmanTransfer
+from app.models.flat_occupancy import FlatOccupancyHistory
 from app.schemas.mobile import (
     MobileApiResponse,
     UpdateSocietyProfileRequest,
@@ -21,12 +22,17 @@ from app.schemas.mobile import (
     VerifyChairmanTransferOtpRequest,
     CompleteChairmanTransferRequest,
     VerifyAndCompleteChairmanTransferRequest,
-    CancelChairmanTransferRequest
+    CancelChairmanTransferRequest,
+    ChairmanUpdateMemberRequest,
+    ChairmanChangeFlatRequest,
+    ChairmanReplaceMemberRequest
 )
 from app.api.v1.mobile.deps import get_current_mobile_user, format_user_details, require_chairman_user
 from app.services.audit_service import record_audit_log
 from app.services.sms_service import send_sms_otp, generate_otp, normalize_indian_mobile
+import logging
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 @router.get("/chairman/dashboard-summary", response_model=MobileApiResponse)
@@ -1067,3 +1073,595 @@ def cancel_chairman_transfer(
         message="Chairman transfer request cancelled successfully",
         data={"transfer_id": transfer.id, "status": "CANCELLED"}
     )
+
+
+# ==============================================================================
+# CHAIRMAN MEMBER MANAGEMENT ENDPOINTS
+# ==============================================================================
+
+@router.get("/chairman/members", response_model=MobileApiResponse)
+def get_society_members(
+    search: Optional[str] = Query(None),
+    block_id: Optional[int] = Query(None),
+    status: Optional[str] = Query("ALL"),
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Retrieve full list of members in the Chairman's society with search and filter capabilities."""
+    soc_id = current_user.society_id
+    query = db.query(User).filter(User.society_id == soc_id)
+
+    if status and status.upper() == "ACTIVE":
+        query = query.filter(User.is_active == True)
+    elif status and status.upper() == "INACTIVE":
+        query = query.filter(User.is_active == False)
+
+    if block_id is not None and block_id > 0:
+        query = query.filter(User.block_id == block_id)
+
+    if search and search.strip():
+        q_term = f"%{search.strip()}%"
+        query = query.filter(
+            (User.name.ilike(q_term)) |
+            (User.mobile_number.ilike(q_term)) |
+            (User.flat_number.ilike(q_term)) |
+            (User.email.ilike(q_term))
+        )
+
+    users = query.order_by(User.id.asc()).all()
+
+    # Pre-fetch blocks and meters for fast mapping
+    blocks_map = {b.id: b.title for b in db.query(Block).filter(Block.society_id == soc_id).all()}
+    meters_by_user = {m.user_id: m for m in db.query(Meter).filter(Meter.society_id == soc_id).all() if m.user_id}
+    meters_by_flat = {(m.block_id, m.flat_number): m for m in db.query(Meter).filter(Meter.society_id == soc_id).all()}
+
+    role_names = {1: "Resident", 2: "Committee Admin", 3: "Chairman"}
+
+    result = []
+    for u in users:
+        meter = meters_by_user.get(u.id) or meters_by_flat.get((u.block_id, u.flat_number))
+        result.append({
+            "user_id": u.id,
+            "name": u.name,
+            "mobile_number": u.mobile_number,
+            "email": u.email or "",
+            "user_type": u.user_type,
+            "user_role": role_names.get(u.user_type, "Resident"),
+            "block_id": u.block_id,
+            "block_title": blocks_map.get(u.block_id, ""),
+            "flat_number": u.flat_number or "",
+            "meter_number": meter.meter_serial_number if meter else None,
+            "meter_id": meter.id if meter else None,
+            "previous_unit": u.previous_unit or 0,
+            "current_unit": meter.current_reading if meter else (u.previous_unit or 0),
+            "approval_status": u.approval_status,
+            "is_active": u.is_active,
+            "has_fcm_token": bool(u.fcm_token and u.fcm_token.strip()),
+            "created_at": u.created_at.isoformat() if u.created_at else None
+        })
+
+    return MobileApiResponse(
+        status=1,
+        message="Society members retrieved successfully",
+        data=result
+    )
+
+
+@router.get("/chairman/members/{member_id}", response_model=MobileApiResponse)
+def get_member_details(
+    member_id: int,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Retrieve complete profile, meter, and occupancy details for a specific member."""
+    soc_id = current_user.society_id
+    member = db.query(User).filter(User.id == member_id, User.society_id == soc_id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found in your society")
+
+    block = db.query(Block).filter(Block.id == member.block_id).first() if member.block_id else None
+    meter = db.query(Meter).filter(
+        Meter.society_id == soc_id,
+        (Meter.user_id == member.id) | ((Meter.block_id == member.block_id) & (Meter.flat_number == member.flat_number))
+    ).first()
+
+    # Past occupancy history
+    occupancies = db.query(FlatOccupancyHistory).filter(
+        FlatOccupancyHistory.user_id == member.id
+    ).order_by(FlatOccupancyHistory.id.desc()).all()
+
+    occ_data = [
+        {
+            "id": o.id,
+            "flat_number": o.flat_number,
+            "role": o.role,
+            "start_date": o.start_date.isoformat() if o.start_date else None,
+            "end_date": o.end_date.isoformat() if o.end_date else None,
+            "is_current": o.is_current,
+            "start_meter_reading": o.start_meter_reading,
+            "end_meter_reading": o.end_meter_reading,
+            "move_out_reason": o.move_out_reason
+        }
+        for o in occupancies
+    ]
+
+    readings_count = db.query(func.count(MeterReading.id)).filter(MeterReading.user_id == member.id).scalar() or 0
+    bills_count = db.query(func.count(Bill.id)).filter(Bill.user_id == member.id).scalar() or 0
+
+    role_names = {1: "Resident", 2: "Committee Admin", 3: "Chairman"}
+
+    return MobileApiResponse(
+        status=1,
+        message="Member details retrieved",
+        data={
+            "user_id": member.id,
+            "name": member.name,
+            "mobile_number": member.mobile_number,
+            "email": member.email or "",
+            "user_type": member.user_type,
+            "user_role": role_names.get(member.user_type, "Resident"),
+            "society_id": member.society_id,
+            "block_id": member.block_id,
+            "block_title": block.title if block else "",
+            "flat_number": member.flat_number or "",
+            "meter_number": meter.meter_serial_number if meter else None,
+            "meter_current_reading": meter.current_reading if meter else (member.previous_unit or 0),
+            "previous_unit": member.previous_unit or 0,
+            "is_active": member.is_active,
+            "approval_status": member.approval_status,
+            "readings_count": readings_count,
+            "bills_count": bills_count,
+            "occupancy_history": occ_data,
+            "created_at": member.created_at.isoformat() if member.created_at else None
+        }
+    )
+
+
+@router.put("/chairman/members/{member_id}", response_model=MobileApiResponse)
+def update_member_profile(
+    member_id: int,
+    payload: ChairmanUpdateMemberRequest,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Edit allowed profile fields of a society member (Name, Email, Mobile, Active Status)."""
+    soc_id = current_user.society_id
+    member = db.query(User).filter(User.id == member_id, User.society_id == soc_id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found in your society")
+
+    # Safety: Cannot change another user's role to Chairman or edit another Chairman
+    if member.user_type == 3 and current_user.id != member.id:
+        return MobileApiResponse(status=0, message="Cannot edit another Chairman profile. Use Chairman Transfer.", data={})
+
+    before_state = {
+        "user_id": member.id,
+        "name": member.name,
+        "mobile_number": member.mobile_number,
+        "email": member.email,
+        "is_active": member.is_active
+    }
+
+    if payload.name is not None and payload.name.strip():
+        member.name = payload.name.strip()
+
+    if payload.email is not None:
+        member.email = payload.email.strip() if payload.email.strip() else None
+
+    if payload.is_active is not None:
+        member.is_active = payload.is_active
+
+    # Mobile number change safety
+    if payload.mobile_number is not None and payload.mobile_number.strip():
+        new_mobile = normalize_indian_mobile(payload.mobile_number.strip())
+        if not new_mobile:
+            return MobileApiResponse(status=0, message="Please enter a valid 10-digit Indian mobile number", data={})
+
+        if new_mobile != member.mobile_number:
+            # Check collision across ALL users
+            conflict = db.query(User).filter(User.mobile_number == new_mobile, User.id != member.id).first()
+            if conflict:
+                return MobileApiResponse(status=0, message="This mobile number is already registered to another user", data={})
+
+            member.mobile_number = new_mobile
+            # Clear old FCM token so they re-sync upon logging in with the new number
+            member.fcm_token = None
+
+    after_state = {
+        "user_id": member.id,
+        "name": member.name,
+        "mobile_number": member.mobile_number,
+        "email": member.email,
+        "is_active": member.is_active
+    }
+
+    record_audit_log(
+        db=db,
+        actor_type="USER",
+        actor_id=str(current_user.id),
+        actor_email=current_user.email,
+        action="MEMBER_PROFILE_UPDATED",
+        entity_type="USER",
+        entity_id=str(member.id),
+        society_id=soc_id,
+        before_state=before_state,
+        after_state=after_state
+    )
+
+    db.commit()
+    db.refresh(member)
+
+    # Notify member of profile update
+    try:
+        from app.services.notification_service import send_user_notification
+        send_user_notification(
+            db=db,
+            user_id=member.id,
+            title="Profile Updated",
+            message="Your member profile information has been updated by the Society Chairman.",
+            notification_type="ANNOUNCEMENT",
+            sender_id=current_user.id
+        )
+    except Exception as e:
+        logger.warning(f"Failed to send profile update notice: {e}")
+
+    return MobileApiResponse(
+        status=1,
+        message=f"Member '{member.name}' profile updated successfully",
+        data={
+            "user_id": member.id,
+            "name": member.name,
+            "mobile_number": member.mobile_number,
+            "email": member.email,
+            "is_active": member.is_active
+        }
+    )
+
+
+@router.put("/chairman/members/{member_id}/change-flat", response_model=MobileApiResponse)
+def change_member_flat(
+    member_id: int,
+    payload: ChairmanChangeFlatRequest,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Move an existing resident to another flat in the same society with complete history preservation."""
+    soc_id = current_user.society_id
+    member = db.query(User).filter(User.id == member_id, User.society_id == soc_id).first()
+    if not member:
+        raise HTTPException(status_code=404, detail="Member not found in your society")
+
+    target_block = db.query(Block).filter(Block.id == payload.target_block_id, Block.society_id == soc_id).first()
+    if not target_block:
+        return MobileApiResponse(status=0, message="Target block does not belong to your society", data={})
+
+    clean_flat = payload.target_flat_number.strip().upper()
+
+    # Check if target flat is already occupied by another active member
+    occupied = db.query(User).filter(
+        User.society_id == soc_id,
+        User.block_id == payload.target_block_id,
+        User.flat_number == clean_flat,
+        User.id != member.id,
+        User.is_active == True
+    ).first()
+
+    if occupied:
+        return MobileApiResponse(
+            status=0,
+            message=f"Flat {clean_flat} in {target_block.title} is already occupied by {occupied.name}",
+            data={}
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    old_flat = member.flat_number
+    old_block_id = member.block_id
+
+    try:
+        # 1. Close previous occupancy history record
+        prev_occ = db.query(FlatOccupancyHistory).filter(
+            FlatOccupancyHistory.user_id == member.id,
+            FlatOccupancyHistory.is_current == True
+        ).first()
+
+        old_meter = db.query(Meter).filter(
+            Meter.society_id == soc_id,
+            Meter.block_id == old_block_id,
+            Meter.flat_number == old_flat
+        ).first()
+
+        if prev_occ:
+            prev_occ.is_current = False
+            prev_occ.end_date = now_utc
+            prev_occ.end_meter_reading = old_meter.current_reading if old_meter else (member.previous_unit or 0)
+            prev_occ.move_out_reason = payload.reason or f"Moved to Flat {clean_flat} ({target_block.title})"
+
+        # 2. Find target meter in new flat
+        target_meter = db.query(Meter).filter(
+            Meter.society_id == soc_id,
+            Meter.block_id == payload.target_block_id,
+            Meter.flat_number == clean_flat
+        ).first()
+
+        start_reading = target_meter.current_reading if target_meter else 0
+
+        # 3. Update member's flat and baseline unit
+        member.block_id = payload.target_block_id
+        member.flat_number = clean_flat
+        member.previous_unit = start_reading
+
+        # 4. Link meter to member
+        if target_meter:
+            target_meter.user_id = member.id
+
+        # 5. Open new occupancy history record
+        new_occ = FlatOccupancyHistory(
+            society_id=soc_id,
+            block_id=payload.target_block_id,
+            flat_number=clean_flat,
+            user_id=member.id,
+            meter_id=target_meter.id if target_meter else None,
+            role="PRIMARY_RESIDENT",
+            start_date=now_utc,
+            is_current=True,
+            start_meter_reading=start_reading,
+            assigned_by_user_id=current_user.id
+        )
+        db.add(new_occ)
+
+        record_audit_log(
+            db=db,
+            actor_type="USER",
+            actor_id=str(current_user.id),
+            actor_email=current_user.email,
+            action="MEMBER_FLAT_CHANGED",
+            entity_type="USER",
+            entity_id=str(member.id),
+            society_id=soc_id,
+            before_state={"old_block_id": old_block_id, "old_flat": old_flat},
+            after_state={"new_block_id": payload.target_block_id, "new_flat": clean_flat, "reason": payload.reason}
+        )
+
+        db.commit()
+        db.refresh(member)
+
+        # Notify member
+        try:
+            from app.services.notification_service import send_user_notification
+            send_user_notification(
+                db=db,
+                user_id=member.id,
+                title="Flat Assignment Changed",
+                message=f"You have been reassigned to Flat {clean_flat} ({target_block.title}). Your previous reading history is preserved.",
+                notification_type="ANNOUNCEMENT",
+                sender_id=current_user.id
+            )
+        except Exception as e:
+            logger.warning(f"Failed to notify flat change: {e}")
+
+        return MobileApiResponse(
+            status=1,
+            message=f"Member '{member.name}' successfully moved to Flat {clean_flat}",
+            data={
+                "user_id": member.id,
+                "block_id": member.block_id,
+                "block_title": target_block.title,
+                "flat_number": member.flat_number,
+                "previous_unit": member.previous_unit
+            }
+        )
+    except Exception as e:
+        db.rollback()
+        return MobileApiResponse(status=0, message=f"Flat change failed: {str(e)}", data={})
+
+
+@router.post("/chairman/members/{member_id}/replace", response_model=MobileApiResponse)
+async def replace_society_member(
+    member_id: int,
+    payload: ChairmanReplaceMemberRequest,
+    current_user: User = Depends(require_chairman_user),
+    db: Session = Depends(get_db)
+):
+    """Replace an outgoing resident with a new resident for a flat while preserving all historical records."""
+    soc_id = current_user.society_id
+    old_member = db.query(User).filter(User.id == member_id, User.society_id == soc_id).first()
+    if not old_member:
+        raise HTTPException(status_code=404, detail="Member not found in your society")
+
+    if old_member.user_type == 3:
+        return MobileApiResponse(status=0, message="Cannot replace a Chairman using this flow. Use Chairman Transfer.", data={})
+
+    new_mobile = normalize_indian_mobile(payload.new_mobile_number)
+    if not new_mobile:
+        return MobileApiResponse(status=0, message="Please enter a valid 10-digit Indian mobile number", data={})
+
+    if new_mobile == old_member.mobile_number:
+        return MobileApiResponse(status=0, message="New resident mobile cannot be identical to the current resident's mobile", data={})
+
+    # Collision Check across societies
+    candidate = db.query(User).filter(User.mobile_number == new_mobile).first()
+    if candidate:
+        if candidate.society_id and candidate.society_id != soc_id:
+            return MobileApiResponse(status=0, message="This mobile number belongs to a user registered in another society. Cross-society reassignment is prohibited.", data={})
+        if candidate.user_type == 3:
+            return MobileApiResponse(status=0, message="This mobile number is registered as a Chairman. Cannot assign Chairman as resident.", data={})
+
+    now_utc = datetime.now(timezone.utc)
+    flat_num = old_member.flat_number
+    blk_id = old_member.block_id
+
+    if not flat_num:
+        return MobileApiResponse(status=0, message="This member is not assigned to any flat", data={})
+
+    try:
+        # Find physical meter for this flat
+        meter = db.query(Meter).filter(
+            Meter.society_id == soc_id,
+            Meter.block_id == blk_id,
+            Meter.flat_number == flat_num
+        ).first()
+
+        current_meter_reading = meter.current_reading if meter else (old_member.previous_unit or 0)
+
+        # 1. Close Outgoing Member's Current Occupancy
+        curr_occ = db.query(FlatOccupancyHistory).filter(
+            FlatOccupancyHistory.user_id == old_member.id,
+            FlatOccupancyHistory.is_current == True
+        ).first()
+
+        if curr_occ:
+            curr_occ.is_current = False
+            curr_occ.end_date = now_utc
+            curr_occ.end_meter_reading = current_meter_reading
+            curr_occ.move_out_reason = payload.reason or f"Replaced by {payload.new_name.strip()}"
+
+        # 2. Update Outgoing Member Profile Safely
+        # DO NOT delete Rahul. DO NOT reassign historical bills/readings!
+        before_state = {
+            "old_member_id": old_member.id,
+            "old_member_name": old_member.name,
+            "old_member_mobile": old_member.mobile_number,
+            "flat_number": flat_num,
+            "block_id": blk_id,
+            "final_meter_reading": current_meter_reading
+        }
+
+        # Clear flat assignment from outgoing resident
+        old_member.flat_number = None
+        old_member.block_id = None
+        if payload.deactivate_old_member:
+            old_member.is_active = False
+
+        # Clear old member's FCM token so future flat notifications are stopped
+        old_member.fcm_token = None
+
+        # 3. Handle Incoming Resident (Amit)
+        if candidate:
+            # Reuse existing resident account in same society
+            candidate.name = payload.new_name.strip()
+            if payload.new_email:
+                candidate.email = payload.new_email.strip()
+            candidate.society_id = soc_id
+            candidate.block_id = blk_id
+            candidate.flat_number = flat_num
+            candidate.previous_unit = current_meter_reading
+            candidate.is_active = True
+            candidate.approval_status = 1
+            new_user = candidate
+        else:
+            # Register new resident account
+            new_user = User(
+                name=payload.new_name.strip(),
+                mobile_number=new_mobile,
+                email=payload.new_email.strip() if payload.new_email else None,
+                user_type=1,
+                society_id=soc_id,
+                block_id=blk_id,
+                flat_number=flat_num,
+                approval_status=1,
+                previous_unit=current_meter_reading,
+                is_active=True
+            )
+            db.add(new_user)
+            db.flush()
+
+        # 4. Link Meter to New Current Resident
+        if meter:
+            meter.user_id = new_user.id
+            # meter.current_reading remains unchanged!
+
+        # 5. Open New Occupancy History Record
+        new_occ = FlatOccupancyHistory(
+            society_id=soc_id,
+            block_id=blk_id,
+            flat_number=flat_num,
+            user_id=new_user.id,
+            meter_id=meter.id if meter else None,
+            role="PRIMARY_RESIDENT",
+            start_date=now_utc,
+            is_current=True,
+            start_meter_reading=current_meter_reading,
+            assigned_by_user_id=current_user.id
+        )
+        db.add(new_occ)
+
+        # 6. Audit Logging
+        after_state = {
+            "new_member_id": new_user.id,
+            "new_member_name": new_user.name,
+            "new_member_mobile": new_user.mobile_number,
+            "flat_number": flat_num,
+            "block_id": blk_id,
+            "starting_meter_reading": current_meter_reading,
+            "reason": payload.reason
+        }
+
+        record_audit_log(
+            db=db,
+            actor_type="USER",
+            actor_id=str(current_user.id),
+            actor_email=current_user.email,
+            action="MEMBER_REPLACED",
+            entity_type="FLAT",
+            entity_id=f"{blk_id}-{flat_num}",
+            society_id=soc_id,
+            before_state=before_state,
+            after_state=after_state
+        )
+
+        db.commit()
+        db.refresh(old_member)
+        db.refresh(new_user)
+
+        # 7. Targeted Notifications (NO society-wide broadcast!)
+        try:
+            from app.services.notification_service import send_user_notification
+
+            # A. New Member Notification
+            send_user_notification(
+                db=db,
+                user_id=new_user.id,
+                title=f"Welcome to Flat {flat_num}",
+                message=f"You are now registered as the active resident for Flat {flat_num}. Your water meter baseline starts at {current_meter_reading} units.",
+                notification_type="ANNOUNCEMENT",
+                sender_id=current_user.id
+            )
+
+            # B. Old Member Notification (if still active in database)
+            if old_member.is_active:
+                send_user_notification(
+                    db=db,
+                    user_id=old_member.id,
+                    title="Residency Concluded",
+                    message=f"Your active occupancy for Flat {flat_num} has concluded. Your historical billing and reading records remain safely accessible in your account.",
+                    notification_type="ANNOUNCEMENT",
+                    sender_id=current_user.id
+                )
+
+            # C. Chairman Confirmation
+            send_user_notification(
+                db=db,
+                user_id=current_user.id,
+                title="Society Member Changed",
+                message=f"The resident for Flat {flat_num} has been successfully changed from {old_member.name} to {new_user.name}.",
+                notification_type="ANNOUNCEMENT",
+                sender_id=current_user.id
+            )
+        except Exception as notif_err:
+            logger.warning(f"Member replacement notification note: {notif_err}")
+
+        return MobileApiResponse(
+            status=1,
+            message=f"Resident for Flat {flat_num} successfully changed to {new_user.name} 🎉",
+            data={
+                "flat_number": flat_num,
+                "old_member_name": old_member.name,
+                "new_member_name": new_user.name,
+                "new_member_mobile": new_user.mobile_number,
+                "meter_reading_baseline": current_meter_reading
+            }
+        )
+    except Exception as e:
+        db.rollback()
+        return MobileApiResponse(status=0, message=f"Member replacement failed: {str(e)}", data={})
+
